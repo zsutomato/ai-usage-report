@@ -144,4 +144,4 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 
 **当前版本**：v1.4  
 **最后更新**：2026-04-04  
-**维护人**：QC（ericqcsun）
+**维护人**：QC
