@@ -1,3 +1,10 @@
+---
+name: ai-usage-report
+slug: ai-usage-report
+version: 2.0.0
+description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守执行。"
+---
+
 # AI 使用周报 Skill
 
 ## 功能说明
