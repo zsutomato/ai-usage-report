@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.4.1
+version: 2.4.2
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -481,12 +481,37 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
 
 3. 若 `GetMe` 成功：
    - 默认选用 `is_primary: true` 的 alias；若有多个 primary，优先取第一个
-   - 邮件主题**固定使用英文 ASCII**：`[AI Weekly Report] {统计起始日期 YYYY-MM-DD} - {USER_WXID}`
-     - 原因：避免主题中出现姓名或各国语言字符，降低不同国家/客户端的编码兼容问题
-     - 示例：`[AI Weekly Report] 2026-04-18 - ericqcsun`
+   - **邮件主题必须严格等于以下字面模板**（方括号、空格、连字符、日期格式**一个字符都不得变**）：
+
+     ```
+     [AI Weekly Report] {统计起始日期 YYYY-MM-DD} - {USER_WXID}
+     ```
+
+     ✅ **正确格式（这是唯一允许的格式）**：
+     - `[AI Weekly Report] 2026-04-18 - ericqcsun`
+     - `[AI Weekly Report] 2026-04-20 - kaihongfu`
+
+     ❌ **禁止的变体**（agent 若产出以下任一，即为违规，必须重算后再发送）：
+     - `AI 使用周报 | kaihongfu | 2026-04-20 ~ 2026-04-24`（禁止中文前缀 / 管道符 / 日期范围）
+     - `AI Usage Report 2026-04-18 to 2026-04-24`（禁止改写前缀 / 用 "to" / 缺失用户名）
+     - `[AI 周报] 2026-04-20 - kaihongfu`（禁止方括号内用中文）
+     - `[AI Weekly Report] 2026-04-20~2026-04-24 - kaihongfu`（禁止日期范围，**只能用起始日期这一个日期**）
+     - `[AI Weekly Report] - kaihongfu`（禁止缺失日期）
+     - `[AI Weekly Report] 2026-04-20`（禁止缺失用户名）
+
+     **即使**用户在当前对话里主要使用中文、或 agent 觉得"中文标题对用户更友好"，邮件主题**仍必须使用上述英文 ASCII 字面模板**，不得以任何理由扩展或替换。**不得把报告正文 Markdown 的 h1 标题（"AI 使用周报"）当作邮件主题来源**。
+
+     **主题自检（必须执行）**：生成主题字符串后、构造 Phase 1 请求之前，必须用下面的正则验证一次：
+
+     ```
+     ^\[AI Weekly Report\] \d{4}-\d{2}-\d{2} - [a-zA-Z0-9_.-]+$
+     ```
+
+     若不匹配，说明主题被改写了，**必须重算**，不得进入 Phase 1。
+
    - 邮件正文直接使用刚生成的 Markdown 文件全文，`body_format` 使用 `PLAIN`
    - 若 `REPORT_CC_EMAILS` 为非空列表，则在发送参数中追加 `cc`；若为空，则**不要传 `cc` 参数**
-   - **能力边界说明**：`qq-mail` 当前即便传入 `cc`，实际投递效果也可能把这些地址并入 To；因此 Skill 仅把 `REPORT_CC_EMAILS` 作为“额外收件人”输入，不对标准邮件头里的 CC 语义做承诺
+   - **能力边界说明**：`qq-mail` 当前即便传入 `cc`，实际投递效果也可能把这些地址并入 To；因此 Skill 仅把 `REPORT_CC_EMAILS` 作为"额外收件人"输入，不对标准邮件头里的 CC 语义做承诺
 
 #### Step 6C：发起 Phase 1 发送预览
 
@@ -497,11 +522,23 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
 - 返回 `operation_summary`
 - 返回 `confirmation_token`
 
-拿到后，向用户展示简短确认信息：
+拿到后，向用户展示简短确认信息（**主题必须用反引号包起来，让用户能一眼看清是否符合标准格式**）：
+
 - 若 `REPORT_CC_EMAILS` 为空：
-  > 即将从 `{发件邮箱}` 发送到 `{REPORT_TO_EMAIL}`，主题为 `{邮件主题}`。如确认发送，请回复“确认发送”。
+  > 即将发送，请确认以下信息：
+  > - 主题：`{邮件主题}`
+  > - 发件：`{发件邮箱}`
+  > - 收件：`{REPORT_TO_EMAIL}`
+  >
+  > 如确认发送，请回复"确认发送"。
 - 若 `REPORT_CC_EMAILS` 非空：
-  > 即将从 `{发件邮箱}` 发送到主收件人 `{REPORT_TO_EMAIL}`，并附带其他收件人 `{REPORT_CC_EMAILS}`，主题为 `{邮件主题}`。如确认发送，请回复“确认发送”。
+  > 即将发送，请确认以下信息：
+  > - 主题：`{邮件主题}`
+  > - 发件：`{发件邮箱}`
+  > - 收件：`{REPORT_TO_EMAIL}`
+  > - 额外收件人：`{REPORT_CC_EMAILS}`
+  >
+  > 如确认发送，请回复"确认发送"。
 
 #### Step 6D：等待用户明确确认后完成 Phase 2
 
@@ -581,6 +618,7 @@ curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL
 
 ## Changelog
 
+- **v2.4.2** (2026-04-28)：加固 Step 6 邮件主题约束，防止 agent 生成"AI 使用周报 \| xxx \| 日期范围"、"AI Usage Report xxx to xxx" 等非标准格式。新增 6 条反例禁止清单、硬规定主题字面模板不得改写、禁止把报告 h1 标题当主题来源；Phase 1 发送前必须通过正则自检 `^\[AI Weekly Report\] \d{4}-\d{2}-\d{2} - [a-zA-Z0-9_.-]+$` 才能进入确认流程；Phase 1 预览文案改为多行列表 + 主题反引号显示，便于用户在确认前一眼识别异常主题
 - **v2.4.1** (2026-04-27)：加固 Step 5 任务粒度口径——显式声明"**session 数量不是任务数的代理指标**，同一项目多个 session 按交付物合并"，防止未来 agent 把 session 数当任务数拆分。文档加固，行为不变。
 - **v2.4.0** (2026-04-27)：新增 **CodeBuddy 数据源**，周报同时覆盖 WorkBuddy 和 CodeBuddy 两个产品的使用记录。① Step 4 第一层把单源 `userDataPath` 推导改为多产品 `DATA_SOURCES` 列表（WorkBuddy + CodeBuddy CN + CodeBuddy 国际版），两个产品共享相同 DB schema 所以采集逻辑完全复用；② 每条 session 记录打 `product` 标签，跨源按 `conversationId` 去重合并，某个单源失败不影响其他源；③ Step 4 第二层 memory 扫描同时覆盖 `.workbuddy/memory/` 和 `.codebuddy/memory/` 两个目录，按文件绝对路径去重；④ Step 5 报告元信息新增 `数据来源产品` 字段；对话统计支持拆分显示（`总数：135（WorkBuddy 132 + CodeBuddy 3）`）；⑤ 任务清单**不标注产品来源**，保持用户视角"本周我做了啥"干净输出
 - **v2.3.1** (2026-04-27)：Step 2 OTA 源策略升级为双源并行：按"工蜂（内网优先）→ GitHub（公开兜底）"顺序尝试，任一源拿到合法内容即停；新增响应合法性校验（必须以 `---` frontmatter 起始 + 包含 `**当前版本**` 行），防止登录页 HTML 等错误响应被误写回本地；后续工蜂匿名 raw 就绪时 Skill 无需修改即自动切换；"更新此 Skill"段同步双源手动升级命令
@@ -601,6 +639,6 @@ curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.4.1
-**最后更新**：2026-04-27
+**当前版本**：v2.4.2
+**最后更新**：2026-04-28
 **维护人**：QC
