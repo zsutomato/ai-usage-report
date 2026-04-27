@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.4.0
+version: 2.4.1
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -437,6 +437,7 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
 
 为避免不同成员的任务数对比失真，按以下口径决定"1 条任务"的边界：
 
+- **核心原则：产出驱动，不是 session 驱动**。**session 数量不是任务数的代理指标**。同一项目的多个 session（包括跨天、跨产品、同日多次触发、用老 session 继续聊）都应按"交付物"合并——5 个 session 做 1 件事就是 1 条任务；1 个 session 做 5 件独立交付物就是 5 条任务。Agent 生成任务清单时**不得按 session 数拆分**，也不得拿对话数 / session 数当任务数的近似值。
 - **1 条任务 = 1 个独立可交付产出**。交付物是一份文档、一个功能模块、一次对外回复、一场会议纪要、一份分析结论等。
 - **批量同质工作合并为 1 条**，在描述里注明规模。
   - ✅ 正确：`回复客户工单 · 搜索资料 · TAM 工作台（约 600 条）`
@@ -446,6 +447,7 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
   - ❌ 错误：把"中文版大纲""英文版大纲""大纲 review"拆成 3 条
 - **同一项目的连续多日推进合并为 1 条**，在描述里注明跨天。
   - ✅ 正确：`某客户 POC 部署方案设计（周二—周四推进）· 写文档 · 售前`
+- **同一项目的多 session 合并为 1 条**（v2.4.1 起明确）。即便你在同一个 workspace 里开了 5 个 session 推进同一件事，任务清单里也只出现 1 条；session 数只影响【本周对话统计】段，不影响任务条数。
 - **筛选门槛**：闲聊、环境配置、单次工具调用、一次性脚本等**不计入**任务清单（可归到"使用的能力"里体现）。
 - **目标粒度**：大多数成员一周 5–15 条是健康区间。远低于 5 条可能漏报，远高于 20 条大概率粒度过细，需要合并。
 
@@ -579,6 +581,7 @@ curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL
 
 ## Changelog
 
+- **v2.4.1** (2026-04-27)：加固 Step 5 任务粒度口径——显式声明"**session 数量不是任务数的代理指标**，同一项目多个 session 按交付物合并"，防止未来 agent 把 session 数当任务数拆分。文档加固，行为不变。
 - **v2.4.0** (2026-04-27)：新增 **CodeBuddy 数据源**，周报同时覆盖 WorkBuddy 和 CodeBuddy 两个产品的使用记录。① Step 4 第一层把单源 `userDataPath` 推导改为多产品 `DATA_SOURCES` 列表（WorkBuddy + CodeBuddy CN + CodeBuddy 国际版），两个产品共享相同 DB schema 所以采集逻辑完全复用；② 每条 session 记录打 `product` 标签，跨源按 `conversationId` 去重合并，某个单源失败不影响其他源；③ Step 4 第二层 memory 扫描同时覆盖 `.workbuddy/memory/` 和 `.codebuddy/memory/` 两个目录，按文件绝对路径去重；④ Step 5 报告元信息新增 `数据来源产品` 字段；对话统计支持拆分显示（`总数：135（WorkBuddy 132 + CodeBuddy 3）`）；⑤ 任务清单**不标注产品来源**，保持用户视角"本周我做了啥"干净输出
 - **v2.3.1** (2026-04-27)：Step 2 OTA 源策略升级为双源并行：按"工蜂（内网优先）→ GitHub（公开兜底）"顺序尝试，任一源拿到合法内容即停；新增响应合法性校验（必须以 `---` frontmatter 起始 + 包含 `**当前版本**` 行），防止登录页 HTML 等错误响应被误写回本地；后续工蜂匿名 raw 就绪时 Skill 无需修改即自动切换；"更新此 Skill"段同步双源手动升级命令
 - **v2.3.0** (2026-04-27)：修复"本周用老 session 继续聊的项目被整体漏掉"的采集 bug：① Step 4 第一层时间过滤改为优先使用 `updatedAt` / `lastUpdatedAt` 等活跃时间字段，只在所有活跃时间字段缺失时才回退 `createdAt`；② Step 4 第二层候选工作空间列表改为**并集语义**——`SESSION_CWDS ∪ sibling 扫描命中的目录`，sibling 扩展扫描从"失败 fallback"升级为"常态补集"，只要当前工作空间路径可确定就一定执行；③ 新增 `memory-session-cwds` / `memory-session-cwds + expanded-siblings` 数据来源标记；④ sibling 门槛不变（仅父目录下一层 + 本周有 memory 日志）
@@ -598,6 +601,6 @@ curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.4.0
+**当前版本**：v2.4.1
 **最后更新**：2026-04-27
 **维护人**：QC
