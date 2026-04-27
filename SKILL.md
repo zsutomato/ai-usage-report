@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.3.0
+version: 2.3.1
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -43,6 +43,13 @@ date "+%Y-%m-%d %A %H:%M"
 
 ### Step 2：检查并更新 Skill 版本
 
+**OTA 源策略**：Skill 支持两个 OTA 源并行，按顺序尝试，任一源拿到合法内容即停：
+
+1. 工蜂（内网优先，未来主源）：`https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md`
+2. GitHub（当前默认可匿名访问，兜底源）：`https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md`
+
+**为什么是这个顺序**：工蜂更贴近公司内网环境（低延迟、无需翻墙、未来可能承载更多团队 skill），优先使用；但当前工蜂 public 语义为"登录后内网可见"，匿名 `curl` 会被重定向到登录页返回 HTML，所以必须校验响应是否为合法 Markdown，失败就降级到 GitHub。哪天工蜂真正支持匿名 raw 了，这一段无需改动即自动生效。
+
 ① 读取本地版本号：
 
 ```bash
@@ -50,23 +57,59 @@ LOCAL_VER=$(grep "^\*\*当前版本\*\*" ~/.workbuddy/skills/ai-usage-report/SKI
 echo "本地版本：$LOCAL_VER"
 ```
 
-② 从 GitHub 读取最新版本号（**5 秒超时，失败跳过**）：
+② 依次尝试两个 OTA 源，拿合法 Markdown 即停（**每个源 5 秒连接超时，总 10 秒超时**）：
 
 ```bash
-REMOTE_CONTENT=$(curl -s --connect-timeout 5 --max-time 10 \
-  "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md" 2>/dev/null)
+fetch_skill_md() {
+  local url="$1"
+  local content
+  content=$(curl -s --connect-timeout 5 --max-time 10 "$url" 2>/dev/null)
+  # 合法性校验：必须以 YAML frontmatter 起始（`---` 开头），且能抽到 `**当前版本**` 行
+  if [ -z "$content" ]; then
+    return 1
+  fi
+  if ! printf '%s\n' "$content" | head -1 | grep -q '^---$'; then
+    return 1
+  fi
+  if ! printf '%s\n' "$content" | grep -q '^\*\*当前版本\*\*'; then
+    return 1
+  fi
+  printf '%s\n' "$content"
+  return 0
+}
+
+REMOTE_CONTENT=""
+REMOTE_SOURCE=""
+for src in \
+  "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md|woa" \
+  "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md|github"; do
+  url="${src%|*}"
+  name="${src##*|}"
+  if candidate=$(fetch_skill_md "$url"); then
+    REMOTE_CONTENT="$candidate"
+    REMOTE_SOURCE="$name"
+    break
+  fi
+done
+
 if [ -n "$REMOTE_CONTENT" ]; then
   REMOTE_VER=$(echo "$REMOTE_CONTENT" | grep "^\*\*当前版本\*\*" | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?')
-  echo "远端版本：$REMOTE_VER"
+  echo "远端版本：$REMOTE_VER（来源：$REMOTE_SOURCE）"
 else
-  echo "⚠️ 无法连接 GitHub，跳过版本检查"
+  echo "⚠️ 所有 OTA 源都不可用，跳过版本检查"
 fi
 ```
 
+> **合法性校验硬要求**：任何 OTA 源返回的内容，必须同时满足：
+> - 第一行是 `---`（YAML frontmatter 起始）
+> - 正文中存在 `**当前版本**` 行
+>
+> 任何一条不满足立即视为"该源不可用"，继续下一个源。这是防止把登录页 HTML 或其他错误响应误写回本地 SKILL.md 的最后一道防线。
+
 ③ 比对并处理：
 
-- 若**版本一致**或**网络不可达**：跳过，继续执行，在周报末尾附注 `⚠️ Skill 版本未校验（网络不可达）`（仅网络不可达时）
-- 若**远端版本更新**：自动覆盖本地 Skill，告知用户"Skill 已更新至 vX.X，建议重新触发以使用新版本"，然后**按当前版本继续执行**（因为当前 session 中加载的仍是旧版 prompt）
+- 若**版本一致**或**所有 OTA 源都不可达**：跳过，继续执行，在周报末尾附注 `⚠️ Skill 版本未校验（所有 OTA 源不可达）`（仅所有源都不可达时）
+- 若**远端版本更新**：自动覆盖本地 Skill，告知用户"Skill 已更新至 vX.Y.Z（来源：{REMOTE_SOURCE}），建议重新触发以使用新版本"，然后**按当前版本继续执行**（因为当前 session 中加载的仍是旧版 prompt）
 
 ### Step 3：识别用户身份、周报接收邮箱与额外收件人
 
@@ -443,17 +486,23 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
 
 ## 更新此 Skill
 
-此 Skill 托管于 GitHub 公开仓库：
+此 Skill 同时托管在**工蜂（内网优先）**和 **GitHub（公开兜底）**两个 OTA 源，内容自动同步：
 
-```
-https://github.com/zsutomato/ai-usage-report
-```
+- 工蜂：`https://git.woa.com/ericqcsun/ai-usage-report`
+- GitHub：`https://github.com/zsutomato/ai-usage-report`
 
-**手动强制更新**：
+Skill 内置 OTA 会按"工蜂 → GitHub"顺序自动尝试，任一源拿到合法内容即停。
+
+**手动强制更新**（任选其一，两者内容完全一致）：
 
 ```bash
-curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md" \
-  > ~/.workbuddy/skills/ai-usage-report/SKILL.md
+# 工蜂源（公司内网环境推荐；当前匿名 raw 可能受限，失败请换 GitHub 源）
+curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
+  -o ~/.workbuddy/skills/ai-usage-report/SKILL.md
+
+# GitHub 源（当前稳定可匿名访问）
+curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md" \
+  -o ~/.workbuddy/skills/ai-usage-report/SKILL.md
 ```
 
 或直接对 Agent 说：`请手动更新 AI 使用周报 Skill 到最新版本`
@@ -462,6 +511,7 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 
 ## Changelog
 
+- **v2.3.1** (2026-04-27)：Step 2 OTA 源策略升级为双源并行：按"工蜂（内网优先）→ GitHub（公开兜底）"顺序尝试，任一源拿到合法内容即停；新增响应合法性校验（必须以 `---` frontmatter 起始 + 包含 `**当前版本**` 行），防止登录页 HTML 等错误响应被误写回本地；后续工蜂匿名 raw 就绪时 Skill 无需修改即自动切换；"更新此 Skill"段同步双源手动升级命令
 - **v2.3.0** (2026-04-27)：修复"本周用老 session 继续聊的项目被整体漏掉"的采集 bug：① Step 4 第一层时间过滤改为优先使用 `updatedAt` / `lastUpdatedAt` 等活跃时间字段，只在所有活跃时间字段缺失时才回退 `createdAt`；② Step 4 第二层候选工作空间列表改为**并集语义**——`SESSION_CWDS ∪ sibling 扫描命中的目录`，sibling 扩展扫描从"失败 fallback"升级为"常态补集"，只要当前工作空间路径可确定就一定执行；③ 新增 `memory-session-cwds` / `memory-session-cwds + expanded-siblings` 数据来源标记；④ sibling 门槛不变（仅父目录下一层 + 本周有 memory 日志）
 - **v2.2.9** (2026-04-27)：强化 Step 3 周报接收邮箱的首次交互文案，显式强调“接收人/一般是你的上级管理者”、“请勿输入你自己的邮箱”，避免用户误把自己当成收件人；额外收件人追问同步强调“收件人，不是你自己的发件邮箱”
 - **v2.2.8** (2026-04-26)：根据手测结果收敛 `qq-mail` 的多人收件口径：保留历史 `cc` / “周报抄送邮箱”字段兼容，但用户可见文案统一改为“额外收件人”；并明确说明当前实际投递效果可能把这些地址并入 To，不承诺标准 CC 语义
@@ -479,6 +529,6 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.3.0
+**当前版本**：v2.3.1
 **最后更新**：2026-04-27
 **维护人**：QC
