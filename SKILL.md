@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.2.8
+version: 2.2.9
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -81,16 +81,16 @@ fi
 4. **首次运行引导**（非定时任务模式才执行）：
    - 若前 3 步都拿不到企业微信 ID，且当前是人工交互触发（非 automation），**停下来问用户一次**：
      > 检测到首次使用本 Skill，未找到你的企业微信 ID。请输入你的企业微信 ID（例如 `ericqcsun`），之后将写入 `~/.workbuddy/USER.md` 持久化，下次不再询问。
-   - 若前 3 步都拿不到周报接收邮箱，且当前是人工交互触发（非 automation），**再问用户一次**：
+   - 若前 3 步都拿不到周报接收邮箱，且当前是人工交互触发（非 automation），**再问用户一次**。文案必须强调“接收人”，避免用户误填成自己的邮箱：
+     - 若当前对话主要使用中文，直接问（**严格使用下面这句原文，不要改写、不要删减**）：
+       > ⚠️ 请输入**周报接收人**的邮箱（一般是你的上级管理者）。**请勿输入你自己的邮箱地址**——发件身份由 QQ Mail Connector 自动处理，你这里要填的是“周报要发给谁”。例如：`manager@example.com`
+     - 若当前对话主要使用英文，直接问（**严格使用下面这句原文，不要改写、不要删减**）：
+       > ⚠️ Please enter the **recipient's email address** for the weekly report (typically your manager). **Do NOT enter your own email address** — the sender identity is handled by the QQ Mail Connector. You should fill in "who will receive the report". For example: `manager@example.com`
+   - **仅在本次运行属于“首次补齐周报发送配置”时**（即刚刚通过交互拿到了 `REPORT_TO_EMAIL`），若还没有额外收件人配置，则顺带问一次是否还要发给其他人。同样要强调“收件人”语义：
      - 若当前对话主要使用中文，直接问：
-       > 接收周报的邮箱地址是？例如：`manager@example.com`
+       > 需要同时发给其他人吗？如果需要，请输入**其他收件人**的邮箱（同样是收件人，不是你自己的发件邮箱），多个用逗号分隔；如果不需要，回复“无”。
      - 若当前对话主要使用英文，直接问：
-       > What is the email address for receiving the weekly report? For example: `manager@example.com`
-   - **仅在本次运行属于“首次补齐周报发送配置”时**（即刚刚通过交互拿到了 `REPORT_TO_EMAIL`），若还没有额外收件人配置，则顺带问一次是否还要发给其他人：
-     - 若当前对话主要使用中文，直接问：
-       > 需要同时发给其他人吗？如果需要，请输入邮箱地址，多个用逗号分隔；如果不需要，回复“无”。
-     - 若当前对话主要使用英文，直接问：
-       > Do you want to send it to anyone else as additional recipients? If yes, enter email addresses separated by commas; otherwise reply "none".
+       > Do you want to send it to anyone else as additional recipients? If yes, enter the **recipients'** email addresses (not your own sender address), separated by commas; otherwise reply "none".
    - **如果 `REPORT_TO_EMAIL` 已经存在，只是 `REPORT_CC_EMAILS` 缺失，则不要额外追问**，默认按“不额外发送给其他人”处理，避免每次发信都新增交互。
 
    拿到用户回复后，更新 `~/.workbuddy/USER.md`（文件不存在则创建），至少写入以下字段：
@@ -446,6 +446,7 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 
 ## Changelog
 
+- **v2.2.9** (2026-04-27)：强化 Step 3 周报接收邮箱的首次交互文案，显式强调“接收人/一般是你的上级管理者”、“请勿输入你自己的邮箱”，避免用户误把自己当成收件人；额外收件人追问同步强调“收件人，不是你自己的发件邮箱”
 - **v2.2.8** (2026-04-26)：根据手测结果收敛 `qq-mail` 的多人收件口径：保留历史 `cc` / “周报抄送邮箱”字段兼容，但用户可见文案统一改为“额外收件人”；并明确说明当前实际投递效果可能把这些地址并入 To，不承诺标准 CC 语义
 - **v2.2.7** (2026-04-26)：在 `qq-mail` 发送链路中加入固定 To + 可选 CC 配置：Step 3 支持识别/持久化“周报抄送邮箱”，首次补齐周报发送配置时可顺带询问一次 CC；Step 6 在发送参数与确认文案中支持展示 To + CC 摘要
 - **v2.2.6** (2026-04-26)：重写 Step 4 第二层 fallback 语义：不再默认只扫当前 workspace，而是优先尝试受控 sibling 扩展扫描（仅父目录下一层、仅纳入存在 `.workbuddy/memory/` 且统计周期内有日志的目录）；同时把数据来源区分为 `memory-current-workspace` 与 `memory-expanded-siblings`
@@ -461,6 +462,6 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.2.8
-**最后更新**：2026-04-26
+**当前版本**：v2.2.9
+**最后更新**：2026-04-27
 **维护人**：QC
