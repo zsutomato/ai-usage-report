@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.2.9
+version: 2.3.0
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -156,7 +156,7 @@ codebuddy-sessions.vscdb
 
 路径确定后，先探测可用的 Python 命令：`python`、`python3`；Windows 额外尝试 `py -3`。
 
-**第一层完整成功的必要条件**：必须至少有一个可用的 Python 命令，因为 `value` 字段里的 JSON 解析、`createdAt` 时间过滤、`cwd` 提取与去重都要在 Python 侧完成；`sqlite3` CLI 只负责“读库”，**不等于**第一层已经成功。
+**第一层完整成功的必要条件**：必须至少有一个可用的 Python 命令，因为 `value` 字段里的 JSON 解析、活跃时间（`updatedAt` 优先、`createdAt` 兜底）过滤、`cwd` 提取与去重都要在 Python 侧完成；`sqlite3` CLI 只负责“读库”，**不等于**第一层已经成功。
 
 在此基础上，按以下顺序尝试读取：
 
@@ -186,15 +186,23 @@ rows = cur.fetchall()
 - 原因：无法可靠完成 JSON 解析、时间过滤和工作空间路径提取
 - 不得中断整体流程，直接降级到第二层 memory 扫描
 
-> 注意：`value` 是 JSON BLOB，无法在 SQL 层按时间过滤；**无论走方式 A 还是方式 B，最终都必须在 Python 侧基于 `createdAt` 时间戳筛选。**
+> 注意：`value` 是 JSON BLOB，无法在 SQL 层按时间过滤；**无论走方式 A 还是方式 B，最终都必须在 Python 侧基于时间戳筛选。**
+>
+> **时间字段选取（重要）**：
+> - 优先使用 `updatedAt` / `lastUpdatedAt` / `updated_at` 等“最近活跃时间”字段做过滤窗口判断；
+> - 只有在所有活跃时间字段都缺失时，才回退到 `createdAt`；
+> - 原因：周报需要的是“本周真实发生的工作”，而不是“本周新建 session 的工作”。如果一个项目本周继续用上周/更早创建的 session 推进，其 `createdAt` 可能落在窗口外，但 `updatedAt` 仍在本周，**必须纳入**。
 
 从筛选结果中提取：
 - 对话标题（`title`）
 - 所属工作空间**完整路径**（`cwd`）
-- 创建时间
+- 创建时间（`createdAt`）
+- 最近活跃时间（`updatedAt` / `lastUpdatedAt`，若存在）
 - 状态
 
-同时，将所有 `cwd` 路径去重，得到**工作空间路径列表**，供第二层使用。
+同时，将所有 `cwd` 路径去重，得到**session 层工作空间路径列表**（下文称 `SESSION_CWDS`），供第二层使用。
+
+**此列表不代表“本周全部活跃工作空间”**。仍可能存在一种项目：本周有 memory 产出，但 session 的 `createdAt` 和 `updatedAt` 都在窗口外（例如 agent 基于更早 session 只做了少量交互但写了 memory 日志）；或系统时间字段格式不规范被 Python 解析失败；或数据库本身被清理过。第二层必须对这种情况做兜底扩展，不得只相信 `SESSION_CWDS`。
 
 若出现以下任一情况，第一层视为失败但不得中断：
 - 数据库路径不存在
@@ -207,24 +215,32 @@ rows = cur.fetchall()
 
 #### 第二层：扫描 memory 日志（最详细）
 
-先构造 memory 扫描用的**候选工作空间列表**：
+先构造 memory 扫描用的**候选工作空间列表**，采用**并集语义**，不得只相信第一层 `SESSION_CWDS`：
 
-1. 若第一层成功拿到 `cwd` 列表，直接使用该列表
-2. 若第一层失败或 `cwd` 列表为空，但当前工作空间路径可确定，则**优先尝试受控 sibling 扩展扫描**：
+1. **Session 层贡献**：若第一层成功，把 `SESSION_CWDS` 纳入候选集合（可能为空集，也可能是第一层拿到的若干 cwd）。
+2. **Sibling 扩展扫描（常态补集，不是 fallback）**：只要当前工作空间路径可确定，**无论第一层是否成功、是否非空，都必须执行**一次受控 sibling 扩展扫描，把下面的目录加入候选集合：
    - 以当前工作空间的父目录作为候选容器
    - 只检查父目录下一层的直接子目录，**不递归扫描**
-   - 对每个直接子目录 `{candidate}`，只有同时满足以下条件才纳入候选列表：
+   - 对每个直接子目录 `{candidate}`，只有同时满足以下条件才纳入：
      - `{candidate}/.workbuddy/memory/` 存在
      - 统计周期内至少存在 1 个 `YYYY-MM-DD.md` 日期文件
-   - 若命中到 1 个及以上候选目录，则使用这些目录作为第二层扫描范围，并将数据来源标记为 `memory-expanded-siblings`
-   - 若一个候选都没命中，则退回只扫描当前工作空间，并将数据来源标记为 `memory-current-workspace`
-3. 若当前工作空间路径也无法确定，则跳过第二层，直接进入第三层
+3. **最终候选集合 = `SESSION_CWDS ∪ Sibling 扫描命中的目录`**，去重后作为第二层扫描范围。
+4. 若最终候选集合仍为空（第一层失败且 sibling 一个候选都没命中），跳过第二层，直接进入第三层。
+5. 若当前工作空间路径无法确定，则只能依赖 `SESSION_CWDS`；若此时 `SESSION_CWDS` 也为空，直接进入第三层。
+
+**数据来源标记规则**（写入最终报告 `数据来源` 字段）：
+
+- 仅使用了 `SESSION_CWDS`：`memory-session-cwds`
+- 仅使用了 sibling 扫描命中的目录（session 层为空或失败）：`memory-expanded-siblings`
+- 两者都有贡献（最常见）：`memory-session-cwds + expanded-siblings`
+- sibling 扫描因命中集为空未贡献，但当前工作空间本身纳入：`memory-current-workspace`
 
 > 注意：
-> - sibling 扩展扫描只是受控 fallback，不代表这些目录天然属于同一个 WorkBuddy 根工作空间。
+> - sibling 扩展扫描是**常态补集**，不再只在第一层失败时触发。原因：即使第一层成功，`SESSION_CWDS` 也只反映"本周 session 活跃时间落在窗口内的工作空间"。若某项目本周推进了工作但 session 时间戳字段异常、或全部基于更早 session 完成零星交互、且 memory 日志在窗口内 —— 这种情况 `SESSION_CWDS` 会漏掉，必须靠 sibling 扫描把它兜回来。
 > - sibling 扩展扫描只允许看父目录下一层；不得继续递归扫描子孙目录。
-> - 若最终退回只扫当前工作空间，报告中应额外附注 `⚠️ 未拿到全量工作空间列表，memory 层仅扫描当前工作空间，本次统计可能偏低`。
-> - 若使用 sibling 扩展扫描，报告中应额外附注 `⚠️ session 索引层未采集成功，memory 层已按父目录下一层扩展扫描 sibling workspace，请人工检查工作空间列表是否合理`。
+> - sibling 门槛是"本周有 memory 日志"，不会把本周没产出的无关项目误纳入。
+> - 若 sibling 扫描额外贡献了候选目录（即 `memory-expanded-siblings` 或 `memory-session-cwds + expanded-siblings`），报告中应附注 `ℹ️ memory 层已按父目录下一层扩展扫描 sibling workspace，包含本周有 memory 日志但不在 session cwd 列表中的项目`。
+> - 若最终只依赖 `SESSION_CWDS`（sibling 扫描无贡献），且 session 层本身失败或为空，报告中应附注 `⚠️ 未拿到全量工作空间列表，memory 层仅扫描当前工作空间或为空，本次统计可能偏低`。
 
 对每个候选工作空间路径 `{cwd}`：
 - 检查 `{cwd}/.workbuddy/memory/` 是否存在
@@ -286,7 +302,7 @@ mkdir -p ~/Downloads/ai-usage-report
 生成时间：{当前时间，格式 YYYY-MM-DD HH:mm}
 Skill 版本：{当前本地 SKILL.md 中的版本号}
 使用模型：{查看对话窗口顶部模型名称，列出本周用过的所有模型；识别不到则写"未识别"}
-数据来源：{实际采集到数据的层级，如 "sessions + memory + conversation_search"、"sessions only"、"memory-current-workspace" 或 "memory-expanded-siblings"}
+数据来源：{实际采集到数据的层级，如 "sessions + memory(session-cwds + expanded-siblings) + conversation_search"、"sessions only"、"memory-session-cwds"、"memory-expanded-siblings" 或 "memory-current-workspace"}
 
 【本周完成的任务】
 （逐条列出，格式：序号. 任务描述 · 使用能力 · 所属项目/工作空间）
@@ -446,6 +462,7 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 
 ## Changelog
 
+- **v2.3.0** (2026-04-27)：修复"本周用老 session 继续聊的项目被整体漏掉"的采集 bug：① Step 4 第一层时间过滤改为优先使用 `updatedAt` / `lastUpdatedAt` 等活跃时间字段，只在所有活跃时间字段缺失时才回退 `createdAt`；② Step 4 第二层候选工作空间列表改为**并集语义**——`SESSION_CWDS ∪ sibling 扫描命中的目录`，sibling 扩展扫描从"失败 fallback"升级为"常态补集"，只要当前工作空间路径可确定就一定执行；③ 新增 `memory-session-cwds` / `memory-session-cwds + expanded-siblings` 数据来源标记；④ sibling 门槛不变（仅父目录下一层 + 本周有 memory 日志）
 - **v2.2.9** (2026-04-27)：强化 Step 3 周报接收邮箱的首次交互文案，显式强调“接收人/一般是你的上级管理者”、“请勿输入你自己的邮箱”，避免用户误把自己当成收件人；额外收件人追问同步强调“收件人，不是你自己的发件邮箱”
 - **v2.2.8** (2026-04-26)：根据手测结果收敛 `qq-mail` 的多人收件口径：保留历史 `cc` / “周报抄送邮箱”字段兼容，但用户可见文案统一改为“额外收件人”；并明确说明当前实际投递效果可能把这些地址并入 To，不承诺标准 CC 语义
 - **v2.2.7** (2026-04-26)：在 `qq-mail` 发送链路中加入固定 To + 可选 CC 配置：Step 3 支持识别/持久化“周报抄送邮箱”，首次补齐周报发送配置时可顺带询问一次 CC；Step 6 在发送参数与确认文案中支持展示 To + CC 摘要
@@ -462,6 +479,6 @@ curl -s "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.2.9
+**当前版本**：v2.3.0
 **最后更新**：2026-04-27
 **维护人**：QC
