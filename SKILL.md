@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.4.2
+version: 2.5.0
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -29,6 +29,44 @@ Agent 会自动执行以下步骤；若进入 `qq-mail` 发送流程，则会在
 
 收到"执行 AI 使用周报"指令后，严格按以下步骤顺序执行：
 
+### Step 0：识别运行时 host（v2.5.0 起）
+
+**目的**：本 Skill 同时支持安装在 **WorkBuddy** 和 **CodeBuddy** 两个产品下运行。Step 0 用于探测当前 Skill 加载自哪一端，得到变量 `SKILL_HOST`（取值 `workbuddy` 或 `codebuddy`），供后续 Step 2（OTA 写回路径）、Step 3（身份识别优先级）使用。
+
+**探测逻辑（按顺序）**：
+
+1. 若 `~/.codebuddy/skills/ai-usage-report/SKILL.md` 存在且内容与当前执行中的 Skill 一致 → `SKILL_HOST = codebuddy`
+2. 若 `~/.workbuddy/skills/ai-usage-report/SKILL.md` 存在且内容与当前执行中的 Skill 一致 → `SKILL_HOST = workbuddy`
+3. 两个都存在、都一致（极罕见）→ 默认 `SKILL_HOST = workbuddy`（WorkBuddy 为 Skill 原生环境）
+4. 都不存在（Skill 被直接以 adhoc 方式加载）→ 默认 `SKILL_HOST = workbuddy`，并附注 `⚠️ 无法识别 Skill 安装路径，已默认按 WorkBuddy host 运行`
+
+**简化的 bash 探测脚本**：
+
+```bash
+WB_SKILL="$HOME/.workbuddy/skills/ai-usage-report/SKILL.md"
+CB_SKILL="$HOME/.codebuddy/skills/ai-usage-report/SKILL.md"
+
+if [ -f "$CB_SKILL" ] && ! [ -f "$WB_SKILL" ]; then
+  SKILL_HOST=codebuddy
+elif [ -f "$WB_SKILL" ] && ! [ -f "$CB_SKILL" ]; then
+  SKILL_HOST=workbuddy
+elif [ -f "$WB_SKILL" ] && [ -f "$CB_SKILL" ]; then
+  # 两个都存在，默认 workbuddy（也可通过对比哪个 SKILL.md 更新来精细化判断）
+  SKILL_HOST=workbuddy
+else
+  SKILL_HOST=workbuddy
+fi
+echo "SKILL_HOST=$SKILL_HOST"
+```
+
+同时记录下两个**实际存在**的 Skill 安装副本路径（供 Step 2 OTA 双端同步使用）：
+
+```bash
+SKILL_PATHS=()
+[ -f "$WB_SKILL" ] && SKILL_PATHS+=("$WB_SKILL")
+[ -f "$CB_SKILL" ] && SKILL_PATHS+=("$CB_SKILL")
+```
+
 ### Step 1：校准当前时间
 
 执行命令获取准确日期，**不得凭印象猜测**：
@@ -50,11 +88,17 @@ date "+%Y-%m-%d %A %H:%M"
 
 **为什么是这个顺序**：工蜂更贴近公司内网环境（低延迟、无需翻墙、未来可能承载更多团队 skill），优先使用；但当前工蜂 public 语义为"登录后内网可见"，匿名 `curl` 会被重定向到登录页返回 HTML，所以必须校验响应是否为合法 Markdown，失败就降级到 GitHub。哪天工蜂真正支持匿名 raw 了，这一段无需改动即自动生效。
 
-① 读取本地版本号：
+① 读取本地版本号（使用 Step 0 探测到的当前 host 对应副本；若有多个副本存在则取其中一个，版本号应一致）：
 
 ```bash
-LOCAL_VER=$(grep "^\*\*当前版本\*\*" ~/.workbuddy/skills/ai-usage-report/SKILL.md | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?')
-echo "本地版本：$LOCAL_VER"
+# SKILL_HOST / SKILL_PATHS 由 Step 0 设置
+case "$SKILL_HOST" in
+  workbuddy) LOCAL_SKILL="$HOME/.workbuddy/skills/ai-usage-report/SKILL.md" ;;
+  codebuddy) LOCAL_SKILL="$HOME/.codebuddy/skills/ai-usage-report/SKILL.md" ;;
+  *)         LOCAL_SKILL="$HOME/.workbuddy/skills/ai-usage-report/SKILL.md" ;;
+esac
+LOCAL_VER=$(grep "^\*\*当前版本\*\*" "$LOCAL_SKILL" 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+(\.[0-9]+)?')
+echo "本地版本：$LOCAL_VER（host: $SKILL_HOST）"
 ```
 
 ② 依次尝试两个 OTA 源，拿合法 Markdown 即停（**每个源 5 秒连接超时，总 10 秒超时**）：
@@ -109,54 +153,85 @@ fi
 ③ 比对并处理：
 
 - 若**版本一致**或**所有 OTA 源都不可达**：跳过，继续执行，在周报末尾附注 `⚠️ Skill 版本未校验（所有 OTA 源不可达）`（仅所有源都不可达时）
-- 若**远端版本更新**：自动覆盖本地 Skill，告知用户"Skill 已更新至 vX.Y.Z（来源：{REMOTE_SOURCE}），建议重新触发以使用新版本"，然后**按当前版本继续执行**（因为当前 session 中加载的仍是旧版 prompt）
+- 若**远端版本更新**：**双端同步覆盖**——把新版 SKILL.md 写入 `SKILL_PATHS` 里的**所有存在的副本路径**（可能同时包含 `~/.workbuddy/skills/ai-usage-report/SKILL.md` 和 `~/.codebuddy/skills/ai-usage-report/SKILL.md`）。告知用户 `Skill 已更新至 vX.Y.Z（来源：{REMOTE_SOURCE}，已同步到 N 个副本），建议重新触发以使用新版本`，然后**按当前版本继续执行**（因为当前 session 中加载的仍是旧版 prompt）。
+
+  ```bash
+  # $REMOTE_CONTENT 是拉到的新版 Markdown，$SKILL_PATHS 是 Step 0 发现的实际存在副本列表
+  for p in "${SKILL_PATHS[@]}"; do
+    mkdir -p "$(dirname "$p")"
+    printf '%s\n' "$REMOTE_CONTENT" > "$p"
+    echo "已同步 SKILL.md → $p"
+  done
+  ```
+
+  **要点**：不主动创建另一端不存在的副本目录。如果用户只装了 WorkBuddy 端，CodeBuddy 端不存在，不要自动帮他装；等他手动 curl 一次再说。这条规则防止 Skill 越权。
 
 ### Step 3：识别用户身份、周报接收邮箱与额外收件人
 
-按以下顺序逐级查找，**取到即停**：
+**v2.5.0 起按 host 差异化读取身份**。读取优先级如下，**取到即停**：
 
-1. 读取 `~/.workbuddy/USER.md`
-   - 用正则提取企业微信 ID（匹配以下变体：`企业微信 ID`、`企业微信ID`、`企微ID`、`企微 ID`、`wxid`、`WeChat Work ID`、`ericqcsun` 类 ID 格式）
-   - 同时尝试提取周报接收邮箱（匹配以下变体：`周报接收邮箱`、`管理者邮箱`、`收件邮箱`、`report_to_email`、`report email`）
-   - 同时尝试提取额外收件人列表（兼容历史字段：`周报抄送邮箱`、`抄送邮箱`、`cc_email`、`cc emails`、`report_cc_email`）；若值为 `无` / `none` / 空字符串，则视为“已配置但不额外发送给其他人”
-2. 读取 `~/.workbuddy/IDENTITY.md`，同上规则匹配
-3. 读取 `~/.workbuddy/SOUL.md`，提取姓名或身份信息
-4. **首次运行引导**（非定时任务模式才执行）：
-   - 若前 3 步都拿不到企业微信 ID，且当前是人工交互触发（非 automation），**停下来问用户一次**：
-     > 检测到首次使用本 Skill，未找到你的企业微信 ID。请输入你的企业微信 ID（例如 `ericqcsun`），之后将写入 `~/.workbuddy/USER.md` 持久化，下次不再询问。
-   - 若前 3 步都拿不到周报接收邮箱，且当前是人工交互触发（非 automation），**再问用户一次**。文案必须强调“接收人”，避免用户误填成自己的邮箱：
-     - 若当前对话主要使用中文，直接问（**严格使用下面这句原文，不要改写、不要删减**）：
-       > ⚠️ 请输入**周报接收人**的邮箱（一般是你的上级管理者）。**请勿输入你自己的邮箱地址**——发件身份由 QQ Mail Connector 自动处理，你这里要填的是“周报要发给谁”。例如：`manager@example.com`
-     - 若当前对话主要使用英文，直接问（**严格使用下面这句原文，不要改写、不要删减**）：
-       > ⚠️ Please enter the **recipient's email address** for the weekly report (typically your manager). **Do NOT enter your own email address** — the sender identity is handled by the QQ Mail Connector. You should fill in "who will receive the report". For example: `manager@example.com`
-   - **仅在本次运行属于“首次补齐周报发送配置”时**（即刚刚通过交互拿到了 `REPORT_TO_EMAIL`），若还没有额外收件人配置，则顺带问一次是否还要发给其他人。同样要强调“收件人”语义：
-     - 若当前对话主要使用中文，直接问：
-       > 需要同时发给其他人吗？如果需要，请输入**其他收件人**的邮箱（同样是收件人，不是你自己的发件邮箱），多个用逗号分隔；如果不需要，回复“无”。
-     - 若当前对话主要使用英文，直接问：
-       > Do you want to send it to anyone else as additional recipients? If yes, enter the **recipients'** email addresses (not your own sender address), separated by commas; otherwise reply "none".
-   - **如果 `REPORT_TO_EMAIL` 已经存在，只是 `REPORT_CC_EMAILS` 缺失，则不要额外追问**，默认按“不额外发送给其他人”处理，避免每次发信都新增交互。
+**读取阶段（两端都扫描，按 host 优先）**：
 
-   拿到用户回复后，更新 `~/.workbuddy/USER.md`（文件不存在则创建），至少写入以下字段：
-   ```
-   # User Profile
-   - 企业微信 ID：{用户输入或已识别值}
-   - 周报接收邮箱：{用户输入或已识别值}
-   - 周报抄送邮箱：{逗号分隔邮箱列表；兼容历史字段名，实际作为额外收件人列表；若用户明确表示不需要额外发送给其他人，则写“无”}
-   ```
-   然后把这些值分别赋给 `USER_WXID` / `REPORT_TO_EMAIL` / `REPORT_CC_EMAILS`。
+1. **host 对应端的官方身份文件**：
+   - 若 `SKILL_HOST = workbuddy`：依次读 `~/.workbuddy/USER.md` → `~/.workbuddy/IDENTITY.md` → `~/.workbuddy/SOUL.md`（WorkBuddy 社区约定的四件套结构）
+   - 若 `SKILL_HOST = codebuddy`：优先读 `~/.codebuddy/CODEBUDDY.md`（CodeBuddy 官方用户级记忆文件，字段以自然语言格式存在于 `## CodeBuddy Added Memories` 等段落中），尝试从中提取企微 ID / 邮箱；读不到继续
+2. **跨端兜底**（无论 host 是哪端，都再扫一遍另一端的文件，因为用户可能在两端都配置过）：
+   - 若 host=workbuddy 且前面没拿到，再扫 `~/.codebuddy/CODEBUDDY.md`
+   - 若 host=codebuddy 且前面没拿到，再扫 `~/.workbuddy/USER.md` → `~/.workbuddy/IDENTITY.md` → `~/.workbuddy/SOUL.md`
+3. 每个文件都尝试提取以下字段（正则变体）：
+   - 企业微信 ID：`企业微信 ID`、`企业微信ID`、`企微ID`、`企微 ID`、`wxid`、`WeChat Work ID`、`ericqcsun` 类 ID 格式
+   - 周报接收邮箱：`周报接收邮箱`、`管理者邮箱`、`收件邮箱`、`report_to_email`、`report email`
+   - 额外收件人列表（兼容历史字段）：`周报抄送邮箱`、`抄送邮箱`、`cc_email`、`cc emails`、`report_cc_email`；若值为 `无` / `none` / 空字符串，则视为"已配置但不额外发送给其他人"
 
-   **定时任务模式（无人值守）不执行此步**，直接走下一步兜底，避免卡住。
+**首次运行引导**（非定时任务模式才执行）：
 
-5. 最终兜底：
-   - 企业微信 ID 仍然缺失时，执行 `whoami` 获取系统用户名（此时在周报末尾附注 `⚠️ 企业微信 ID 未配置，已用系统用户名兜底，请手动修正文件名`）
-   - 周报接收邮箱若仍缺失，则保留为空字符串；后续发送步骤根据该变量决定是提示配置还是继续发送
-   - 额外收件人若缺失、为空字符串，或明确写为 `无` / `none`，则统一视为空列表，不阻塞发送流程
+- 若读取阶段都拿不到企业微信 ID，且当前是人工交互触发（非 automation），**停下来问用户一次**：
+  > 检测到首次使用本 Skill，未找到你的企业微信 ID。请输入你的企业微信 ID（例如 `ericqcsun`），之后将写入本地持久化（具体路径见下），下次不再询问。
+- 若读取阶段都拿不到周报接收邮箱，且当前是人工交互触发（非 automation），**再问用户一次**。文案必须强调"接收人"，避免用户误填成自己的邮箱：
+  - 若当前对话主要使用中文，直接问（**严格使用下面这句原文，不要改写、不要删减**）：
+    > ⚠️ 请输入**周报接收人**的邮箱（一般是你的上级管理者）。**请勿输入你自己的邮箱地址**——发件身份由 QQ Mail Connector 自动处理，你这里要填的是"周报要发给谁"。例如：`manager@example.com`
+  - 若当前对话主要使用英文，直接问（**严格使用下面这句原文，不要改写、不要删减**）：
+    > ⚠️ Please enter the **recipient's email address** for the weekly report (typically your manager). **Do NOT enter your own email address** — the sender identity is handled by the QQ Mail Connector. You should fill in "who will receive the report". For example: `manager@example.com`
+- **仅在本次运行属于"首次补齐周报发送配置"时**（即刚刚通过交互拿到了 `REPORT_TO_EMAIL`），若还没有额外收件人配置，则顺带问一次是否还要发给其他人。同样要强调"收件人"语义：
+  - 若当前对话主要使用中文，直接问：
+    > 需要同时发给其他人吗？如果需要，请输入**其他收件人**的邮箱（同样是收件人，不是你自己的发件邮箱），多个用逗号分隔；如果不需要，回复"无"。
+  - 若当前对话主要使用英文，直接问：
+    > Do you want to send it to anyone else as additional recipients? If yes, enter the **recipients'** email addresses (not your own sender address), separated by commas; otherwise reply "none".
+- **如果 `REPORT_TO_EMAIL` 已经存在，只是 `REPORT_CC_EMAILS` 缺失，则不要额外追问**，默认按"不额外发送给其他人"处理，避免每次发信都新增交互。
+
+**写回阶段**（只写 host 对应的官方规范位置，不越权跨写另一端）：
+
+- 若 `SKILL_HOST = workbuddy`：更新 `~/.workbuddy/USER.md`（文件不存在则创建）。按 WorkBuddy 社区约定的 Markdown 字段格式写入：
+  ```
+  # User Profile
+  - 企业微信 ID：{用户输入或已识别值}
+  - 周报接收邮箱：{用户输入或已识别值}
+  - 周报抄送邮箱：{逗号分隔邮箱列表；若用户明确表示不需要额外发送给其他人，则写"无"}
+  ```
+- 若 `SKILL_HOST = codebuddy`：追加到 `~/.codebuddy/CODEBUDDY.md` 的 `## CodeBuddy Added Memories` 段落（CodeBuddy 官方约定的记忆段落；若不存在则创建）。格式保持自然语言可读：
+  ```
+  ## CodeBuddy Added Memories
+
+  - 企业微信 ID：{用户输入或已识别值}
+  - 周报接收邮箱：{用户输入或已识别值}
+  - 周报抄送邮箱：{逗号分隔邮箱列表；若不需要则写"无"}
+  ```
+  若段落已存在相关字段，用增量更新方式替换旧值而不是重复追加。
+
+然后把这些值分别赋给 `USER_WXID` / `REPORT_TO_EMAIL` / `REPORT_CC_EMAILS`。
+
+**定时任务模式（无人值守）不执行此步**，直接走下一步兜底，避免卡住。
+
+**最终兜底**：
+- 企业微信 ID 仍然缺失时，执行 `whoami` 获取系统用户名（此时在周报末尾附注 `⚠️ 企业微信 ID 未配置，已用系统用户名兜底，请手动修正文件名`）
+- 周报接收邮箱若仍缺失，则保留为空字符串；后续发送步骤根据该变量决定是提示配置还是继续发送
+- 额外收件人若缺失、为空字符串，或明确写为 `无` / `none`，则统一视为空列表，不阻塞发送流程
 
 将识别到的信息存为变量：
 - `USER_NAME`：姓名（识别不到则为空）
 - `USER_WXID`：企业微信 ID（识别不到则用 `whoami` 结果）
 - `REPORT_TO_EMAIL`：周报接收邮箱（识别不到则为空）
-- `REPORT_CC_EMAILS`：额外收件人列表（沿用历史 cc/抄送字段名兼容；识别不到或明确为“无”则为空列表）
+- `REPORT_CC_EMAILS`：额外收件人列表（沿用历史 cc/抄送字段名兼容；识别不到或明确为"无"则为空列表）
 
 ### Step 4：三层数据采集
 
@@ -355,7 +430,7 @@ rows = cur.fetchall()
 
 #### 第三层：conversation_search 搜索对话摘要（补充细节）
 
-使用 `conversation_search` 工具，按以下策略搜索（中英文各一轮，覆盖不同语言习惯）：
+使用 `conversation_search` 工具，按以下策略搜索（中英文各若干轮，覆盖不同语言习惯）：
 
 - 搜索 1：`query="本周完成的工作和任务"`，限定 `start_date` 和 `end_date` 为统计周期
 - 搜索 2：`query="开发、修复、文档、部署、设计"`，同上日期范围
@@ -365,7 +440,17 @@ rows = cur.fetchall()
 
 每次搜索取 `limit=10`，合并去重。
 
-**如果 conversation_search 无结果，不报错，继续。**
+**并发要求（v2.5.0 起硬约束）**：以上 5 个搜索**必须在同一个 function_calls block 内并发发起**，不得串行等待每一个响应。原因：每个 `conversation_search` 查询是独立的、无依赖的网络 IO 调用，串行执行会累积成 15-25 秒的等待；并发执行总耗时接近单个查询的耗时（5-10 秒），吞吐提升 3-5 倍。
+
+实现要点：
+- Agent 在一次回复中一次性输出 5 个 `conversation_search` 工具调用（同一个 `<function_calls>` 块内）
+- 等全部响应返回后再做合并去重
+- 任意一个查询失败不影响其他查询的结果采用
+- **禁止**为了"逐个看结果决定是否继续"而串行发起
+
+若运行时限制一次最多 N 个并发工具调用，按 N 个一批分组发起；仍然要在同一批内并发，不得单个串行。
+
+**如果 conversation_search 无结果或运行时不提供此工具，不报错，继续。**
 
 #### 数据合并
 
@@ -600,16 +685,30 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
 
 Skill 内置 OTA 会按"工蜂 → GitHub"顺序自动尝试，任一源拿到合法内容即停。
 
-**手动强制更新**（任选其一，两者内容完全一致）：
+**手动强制更新**（v2.5.0 起支持双端安装，把 SKILL.md 写到你实际在用的那端；两端都用就两个命令都跑一遍）：
 
 ```bash
-# 工蜂源（公司内网环境推荐；当前匿名 raw 可能受限，失败请换 GitHub 源）
+# —— 源 × 目标端 矩阵（总共 4 种组合，按你实际情况选）——
+
+# 1. GitHub 源 → WorkBuddy 端（最常见）
+mkdir -p ~/.workbuddy/skills/ai-usage-report && \
+curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md" \
+  -o ~/.workbuddy/skills/ai-usage-report/SKILL.md
+
+# 2. GitHub 源 → CodeBuddy 端
+mkdir -p ~/.codebuddy/skills/ai-usage-report && \
+curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md" \
+  -o ~/.codebuddy/skills/ai-usage-report/SKILL.md
+
+# 3. 工蜂源 → WorkBuddy 端（内网环境可尝试；匿名 raw 当前受限，失败换 GitHub）
+mkdir -p ~/.workbuddy/skills/ai-usage-report && \
 curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
   -o ~/.workbuddy/skills/ai-usage-report/SKILL.md
 
-# GitHub 源（当前稳定可匿名访问）
-curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL.md" \
-  -o ~/.workbuddy/skills/ai-usage-report/SKILL.md
+# 4. 工蜂源 → CodeBuddy 端
+mkdir -p ~/.codebuddy/skills/ai-usage-report && \
+curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
+  -o ~/.codebuddy/skills/ai-usage-report/SKILL.md
 ```
 
 或直接对 Agent 说：`请手动更新 AI 使用周报 Skill 到最新版本`
@@ -618,6 +717,7 @@ curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL
 
 ## Changelog
 
+- **v2.5.0** (2026-04-28)：**Skill 正式双端适配**——可同时安装/运行在 WorkBuddy 和 CodeBuddy 下，互不干扰。① 新增 Step 0 "运行时 host 探测"，输出 `SKILL_HOST` 变量；② Step 2 OTA 从单端改为**双端同步**：更新当前 host 对应副本 + 同步已存在的另一端副本，不主动越权创建另一端；③ Step 3 身份识别分 host 差异化：WorkBuddy host 读 `~/.workbuddy/{USER,IDENTITY,SOUL}.md` 四件套，CodeBuddy host 优先读 `~/.codebuddy/CODEBUDDY.md`（官方）再跨读 `.workbuddy/` 四件套作为兜底；写回只写 host 对应的官方规范文件；④ Step 4 第三层 `conversation_search` 5 个查询改为**并发发起**（同一 function_calls block 内），总耗时从 ~20s 降到 ~5s，整条流水线提速约 3-4 倍；⑤ 文件末尾"手动强制更新"命令扩展为"源 × 目标端"四种组合矩阵
 - **v2.4.2** (2026-04-28)：加固 Step 6 邮件主题约束，防止 agent 生成"AI 使用周报 \| xxx \| 日期范围"、"AI Usage Report xxx to xxx" 等非标准格式。新增 6 条反例禁止清单、硬规定主题字面模板不得改写、禁止把报告 h1 标题当主题来源；Phase 1 发送前必须通过正则自检 `^\[AI Weekly Report\] \d{4}-\d{2}-\d{2} - [a-zA-Z0-9_.-]+$` 才能进入确认流程；Phase 1 预览文案改为多行列表 + 主题反引号显示，便于用户在确认前一眼识别异常主题
 - **v2.4.1** (2026-04-27)：加固 Step 5 任务粒度口径——显式声明"**session 数量不是任务数的代理指标**，同一项目多个 session 按交付物合并"，防止未来 agent 把 session 数当任务数拆分。文档加固，行为不变。
 - **v2.4.0** (2026-04-27)：新增 **CodeBuddy 数据源**，周报同时覆盖 WorkBuddy 和 CodeBuddy 两个产品的使用记录。① Step 4 第一层把单源 `userDataPath` 推导改为多产品 `DATA_SOURCES` 列表（WorkBuddy + CodeBuddy CN + CodeBuddy 国际版），两个产品共享相同 DB schema 所以采集逻辑完全复用；② 每条 session 记录打 `product` 标签，跨源按 `conversationId` 去重合并，某个单源失败不影响其他源；③ Step 4 第二层 memory 扫描同时覆盖 `.workbuddy/memory/` 和 `.codebuddy/memory/` 两个目录，按文件绝对路径去重；④ Step 5 报告元信息新增 `数据来源产品` 字段；对话统计支持拆分显示（`总数：135（WorkBuddy 132 + CodeBuddy 3）`）；⑤ 任务清单**不标注产品来源**，保持用户视角"本周我做了啥"干净输出
@@ -639,6 +739,6 @@ curl -sL "https://raw.githubusercontent.com/zsutomato/ai-usage-report/main/SKILL
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.4.2
+**当前版本**：v2.5.0
 **最后更新**：2026-04-28
 **维护人**：QC
