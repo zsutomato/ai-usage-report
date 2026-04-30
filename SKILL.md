@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.5.0
+version: 2.5.1
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -78,6 +78,20 @@ date "+%Y-%m-%d %A %H:%M"
 根据输出结果计算本次统计周期：**上周六 00:00 — 本周五 23:59**。
 
 将起止日期存为变量供后续步骤使用，格式为 `YYYY-MM-DD`。
+
+**v2.5.1 起：对 end_date 做 clamp，确保不超过今天**（防止第三层 `conversation_search` 后端因未来日期 400）：
+
+```bash
+TODAY=$(date "+%Y-%m-%d")
+# 若周五还没到（如周四下班提前触发、或周五的 0 点 automation），end_date 原本算的是"本周五"，可能晚于 today
+# 后端对 end_date > today 会返回 HTTP 400，必须 clamp
+if [[ "$END_DATE" > "$TODAY" ]]; then
+  END_DATE="$TODAY"
+fi
+echo "统计周期：$START_DATE — $END_DATE（today=$TODAY）"
+```
+
+> **为什么必须 clamp**：2026-04-30（周四）的手测证明，`end_date=2026-05-01` 会让 `conversation_search` 后端返回 HTTP 400。V2 vs V3 对比实验（同一字不差的 query，只改日期参数就从 success 变 400）已排除了 query 形态和其他变量。Step 1 末尾 clamp 到 today 是最小代价的根治手段。
 
 ### Step 2：检查并更新 Skill 版本
 
@@ -440,6 +454,11 @@ rows = cur.fetchall()
 
 每次搜索取 `limit=10`，合并去重。
 
+**日期参数约束（v2.5.1 硬约束）**：
+- `start_date` / `end_date` 统一使用 Step 1 clamp 过的 `START_DATE` / `END_DATE`，格式严格为 `YYYY-MM-DD`，不得携带时间 / 时区 / `T` 分隔符
+- 严禁向 `end_date` 传入晚于 `today` 的日期（Step 1 clamp 已兜底，但 agent 手动改写时也不得违反）
+- 若怀疑日期参数是后端失败的根因，允许单次调试时**不传** `start_date` / `end_date`，让工具使用默认窗口（today-7 / today）
+
 **并发要求（v2.5.0 起硬约束）**：以上 5 个搜索**必须在同一个 function_calls block 内并发发起**，不得串行等待每一个响应。原因：每个 `conversation_search` 查询是独立的、无依赖的网络 IO 调用，串行执行会累积成 15-25 秒的等待；并发执行总耗时接近单个查询的耗时（5-10 秒），吞吐提升 3-5 倍。
 
 实现要点：
@@ -451,6 +470,23 @@ rows = cur.fetchall()
 若运行时限制一次最多 N 个并发工具调用，按 N 个一批分组发起；仍然要在同一批内并发，不得单个串行。
 
 **如果 conversation_search 无结果或运行时不提供此工具，不报错，继续。**
+
+**全失败降级（v2.5.1 新增硬约束）**：若 5 个并发查询**全部返回失败**（`success: false` 或抛异常），不得静默吞掉错误，必须：
+
+1. 收集每个调用的 `message` / `queryHash`（如果有），作为结构化信息保留
+2. 在第三层数据合并阶段**跳过**这 5 个空结果（不影响 sessions + memory 的输出）
+3. 在 Step 5 生成周报时，frontmatter `数据来源` 字段明确写 `sessions + memory (tier3 all-failed)`
+4. 并在周报末尾附一条**简洁的**降级附注（不要把 5 条原始错误日志原样塞进报告）：
+
+   ```
+   ⚠️ 第三层 conversation_search 本次 5 个查询全部失败（HTTP 错误或工具异常），已降级为 sessions + memory only。
+      典型原因：start_date / end_date 参数不合规（如 end_date 超过 today）、后端服务暂不可用。
+      首条失败信息：{results[0].message}
+   ```
+
+   只展示首条 `message` 即可，避免报告被 5 条近似错误日志淹没；完整 5 条错误保留在 agent 内部日志供归因，不输出到周报。
+
+5. 降级附注的目标：让用户一眼看到"第三层失败 + 一句可操作的归因提示"，不误导成"skill 坏了"。
 
 #### 数据合并
 
@@ -717,6 +753,7 @@ curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
 
 ## Changelog
 
+- **v2.5.1** (2026-04-30)：修复 Step 4 第三层 `conversation_search` 在"周五非工作时间触发周报"场景下 5 个查询全部 HTTP 400 的 bug。① **方案 A（根治）**：Step 1 末尾对 `END_DATE` 做 clamp —— `if END_DATE > today then END_DATE = today`。根因：v2.5.0 算出的 `end_date=2026-05-01`（本周五 23:59）在今天是周四时属于未来日期，`conversation_search` 后端会硬校验 `end_date <= today` 返回 400。QC 做的 V2 vs V3 隔离实验（同一字不差的 query，只改日期参数就从 success 变 400）锁定此为唯一根因。② **方案 C（防御+归因）**：第三层 5 个并发查询全失败时不得静默吞掉，必须在 `数据来源` 字段标记 `sessions + memory (tier3 all-failed)`，并在周报末尾附一条简洁降级附注（含首条失败 `message`），方便下次撞类似 bug 时直接归因。③ 明示日期参数格式硬约束：严格 `YYYY-MM-DD`，不得带 T 分隔符 / 时区 / 时间。
 - **v2.5.0** (2026-04-28)：**Skill 正式双端适配**——可同时安装/运行在 WorkBuddy 和 CodeBuddy 下，互不干扰。① 新增 Step 0 "运行时 host 探测"，输出 `SKILL_HOST` 变量；② Step 2 OTA 从单端改为**双端同步**：更新当前 host 对应副本 + 同步已存在的另一端副本，不主动越权创建另一端；③ Step 3 身份识别分 host 差异化：WorkBuddy host 读 `~/.workbuddy/{USER,IDENTITY,SOUL}.md` 四件套，CodeBuddy host 优先读 `~/.codebuddy/CODEBUDDY.md`（官方）再跨读 `.workbuddy/` 四件套作为兜底；写回只写 host 对应的官方规范文件；④ Step 4 第三层 `conversation_search` 5 个查询改为**并发发起**（同一 function_calls block 内），总耗时从 ~20s 降到 ~5s，整条流水线提速约 3-4 倍；⑤ 文件末尾"手动强制更新"命令扩展为"源 × 目标端"四种组合矩阵
 - **v2.4.2** (2026-04-28)：加固 Step 6 邮件主题约束，防止 agent 生成"AI 使用周报 \| xxx \| 日期范围"、"AI Usage Report xxx to xxx" 等非标准格式。新增 6 条反例禁止清单、硬规定主题字面模板不得改写、禁止把报告 h1 标题当主题来源；Phase 1 发送前必须通过正则自检 `^\[AI Weekly Report\] \d{4}-\d{2}-\d{2} - [a-zA-Z0-9_.-]+$` 才能进入确认流程；Phase 1 预览文案改为多行列表 + 主题反引号显示，便于用户在确认前一眼识别异常主题
 - **v2.4.1** (2026-04-27)：加固 Step 5 任务粒度口径——显式声明"**session 数量不是任务数的代理指标**，同一项目多个 session 按交付物合并"，防止未来 agent 把 session 数当任务数拆分。文档加固，行为不变。
@@ -739,6 +776,6 @@ curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.5.0
-**最后更新**：2026-04-28
+**当前版本**：v2.5.1
+**最后更新**：2026-04-30
 **维护人**：QC
