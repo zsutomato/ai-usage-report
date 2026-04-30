@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 2.5.1
+version: 2.5.2
 description: "自动回溯本周 Agent 对话记录，生成标准格式使用周报；若当前环境已配置 qq-mail Connector，则在手动模式下可进入确认发送流程。三层数据采集（SQLite → memory → conversation_search），支持定时任务无人值守生成。"
 ---
 
@@ -630,13 +630,40 @@ Skill 版本：{当前本地 SKILL.md 中的版本号}
 
      若不匹配，说明主题被改写了，**必须重算**，不得进入 Phase 1。
 
-   - 邮件正文直接使用刚生成的 Markdown 文件全文，`body_format` 使用 `PLAIN`
+   - **邮件正文必须 inline（v2.5.2 起硬约束，一个字符不得变）**：
+     - 正文内容 = 刚生成的 `.md` 文件**全文**（不是摘要、不是文件链接、不是"请见附件"）
+     - 构造 `SendMessage` 时：**必须**把 `.md` 文件**全文**作为字符串塞进 `body` 字段
+     - **严格禁止**使用 `attachments` 参数把 `.md` 文件挂载发送——无论出于任何"整洁"、"友好"、"方便归档"的理由，都不得这样做
+     - **严格禁止**使用"请见附件 / 详见附件 / 附件中查看完整报告"等文案代替正文
+     - **严格禁止**只在正文里塞一小段摘要，然后把 `.md` 挂到 `attachments`——这同样算违规
+     - `body_format` 使用 `PLAIN`
+
+     ❌ **禁止的违规行为（agent 若产出以下任一，必须重算后再发送）**：
+     - `SendMessage(..., body="请查收附件", attachments=[{"filename": "xxx.md", "content": "..."}])`（正文只写一句话，内容塞 attachments）
+     - `SendMessage(..., body="本周周报详见附件。", attachments=[...])`
+     - `SendMessage(..., body="周报摘要：本周共完成 X 条任务。完整内容详见附件。", attachments=[...])`（摘要 + 附件组合也禁止）
+     - 任何**非空的** `attachments` 参数（Step 6 整个邮件发送流程**完全不使用** `attachments`）
+
+     ✅ **正确行为**：
+     - `SendMessage(..., body="<刚生成的 .md 文件全文，从 frontmatter 第一行 `---` 开始到文件末尾>", body_format="PLAIN")`
+     - `attachments` 参数**不传**、或显式传空列表 `[]`
+
+     **为什么要这样**：管理者打开邮箱时，应该直接在邮件正文里看到完整周报，**不需要**点开附件。把周报塞 attachments 的后果：① 部分邮件客户端（尤其移动端）默认不预览 .md 附件，管理者看不到内容 ② 归档时正文是空的，搜索引擎搜不到任务关键词 ③ 违反"邮件是最终承载物，不是投递通道"的初衷。
+
    - 若 `REPORT_CC_EMAILS` 为非空列表，则在发送参数中追加 `cc`；若为空，则**不要传 `cc` 参数**
    - **能力边界说明**：`qq-mail` 当前即便传入 `cc`，实际投递效果也可能把这些地址并入 To；因此 Skill 仅把 `REPORT_CC_EMAILS` 作为"额外收件人"输入，不对标准邮件头里的 CC 语义做承诺
 
 #### Step 6C：发起 Phase 1 发送预览
 
 以选中的 alias_id、`REPORT_TO_EMAIL`、主题、正文调用一次 `SendMessage`，**不要带 `confirmation_token`**；若 `REPORT_CC_EMAILS` 非空，则同一次请求里附带 `cc` 参数。
+
+**Phase 1 请求构造前，必须通过以下硬自检（全部通过才允许发起请求）**：
+
+1. **正文 inline 自检**：`body` 字段必须是 `.md` 文件全文字符串，长度与文件字节数接近（允许编码差异），且以 `---`（frontmatter 起始行）开头
+2. **禁用 attachments 自检**：请求参数里**不得**出现 `attachments` 字段；若确需显式传入，必须是空列表 `[]`
+3. **禁用附件文案自检**：`body` 内**不得**包含"请见附件"、"详见附件"、"查看附件"、"附件中"等指示"内容在别处"的字样（这条是兜底，防止 agent 把完整内容 + 附件指引混在一起）
+
+任何一条不通过，说明构造违规，**必须重算正文**，不得进入 Phase 1。
 
 预期结果：
 - 服务端返回 `428` / `42801`
@@ -753,6 +780,7 @@ curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
 
 ## Changelog
 
+- **v2.5.2** (2026-05-01)：加固 Step 6 邮件**正文 inline** 约束，防止 agent 把周报 `.md` 挂到 `attachments` 发送。① 新增 6 行反例清单（`attachments` 非空、"请见附件"文案、"摘要 + 附件"组合等），点名禁止 ② Step 6C Phase 1 请求构造前新增 3 条硬自检：正文 inline（`body` 以 `---` 起、长度接近文件字节数）、禁用 attachments（字段不得出现或必须为 `[]`）、禁用附件文案（body 内不得含"请见附件"等字样）③ 解释为什么要 inline（移动端不预览 .md 附件、归档搜索引擎搜不到、违反"邮件是最终承载物"初衷）。根因：v2.5.1 及以前仅写"邮件正文直接使用 Markdown 文件全文"，措辞太软，agent 觉得"挂附件更整洁"就偷懒塞 `attachments`，管理者收到的邮件正文是空的或只有一句话。
 - **v2.5.1** (2026-04-30)：修复 Step 4 第三层 `conversation_search` 在"周五非工作时间触发周报"场景下 5 个查询全部 HTTP 400 的 bug。① **方案 A（根治）**：Step 1 末尾对 `END_DATE` 做 clamp —— `if END_DATE > today then END_DATE = today`。根因：v2.5.0 算出的 `end_date=2026-05-01`（本周五 23:59）在今天是周四时属于未来日期，`conversation_search` 后端会硬校验 `end_date <= today` 返回 400。QC 做的 V2 vs V3 隔离实验（同一字不差的 query，只改日期参数就从 success 变 400）锁定此为唯一根因。② **方案 C（防御+归因）**：第三层 5 个并发查询全失败时不得静默吞掉，必须在 `数据来源` 字段标记 `sessions + memory (tier3 all-failed)`，并在周报末尾附一条简洁降级附注（含首条失败 `message`），方便下次撞类似 bug 时直接归因。③ 明示日期参数格式硬约束：严格 `YYYY-MM-DD`，不得带 T 分隔符 / 时区 / 时间。
 - **v2.5.0** (2026-04-28)：**Skill 正式双端适配**——可同时安装/运行在 WorkBuddy 和 CodeBuddy 下，互不干扰。① 新增 Step 0 "运行时 host 探测"，输出 `SKILL_HOST` 变量；② Step 2 OTA 从单端改为**双端同步**：更新当前 host 对应副本 + 同步已存在的另一端副本，不主动越权创建另一端；③ Step 3 身份识别分 host 差异化：WorkBuddy host 读 `~/.workbuddy/{USER,IDENTITY,SOUL}.md` 四件套，CodeBuddy host 优先读 `~/.codebuddy/CODEBUDDY.md`（官方）再跨读 `.workbuddy/` 四件套作为兜底；写回只写 host 对应的官方规范文件；④ Step 4 第三层 `conversation_search` 5 个查询改为**并发发起**（同一 function_calls block 内），总耗时从 ~20s 降到 ~5s，整条流水线提速约 3-4 倍；⑤ 文件末尾"手动强制更新"命令扩展为"源 × 目标端"四种组合矩阵
 - **v2.4.2** (2026-04-28)：加固 Step 6 邮件主题约束，防止 agent 生成"AI 使用周报 \| xxx \| 日期范围"、"AI Usage Report xxx to xxx" 等非标准格式。新增 6 条反例禁止清单、硬规定主题字面模板不得改写、禁止把报告 h1 标题当主题来源；Phase 1 发送前必须通过正则自检 `^\[AI Weekly Report\] \d{4}-\d{2}-\d{2} - [a-zA-Z0-9_.-]+$` 才能进入确认流程；Phase 1 预览文案改为多行列表 + 主题反引号显示，便于用户在确认前一眼识别异常主题
@@ -776,6 +804,6 @@ curl -sL "https://git.woa.com/ericqcsun/ai-usage-report/raw/main/SKILL.md" \
 - **v1.3** (2026-04-04)：加入时间校准、版本号、生成时间戳
 - **v1.0** (2026-03-27)：初始版本
 
-**当前版本**：v2.5.1
-**最后更新**：2026-04-30
+**当前版本**：v2.5.2
+**最后更新**：2026-05-01
 **维护人**：QC
