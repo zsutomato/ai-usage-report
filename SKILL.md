@@ -1,7 +1,8 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 3.3.4
+version: 3.3.5
+agent_created: true
 description: "当用户要生成 AI 使用周报、统计本周 Agent 工作产出，或配置每周自动周报时使用。"
 ---
 
@@ -256,7 +257,7 @@ limit = 10
 企业微信 ID：{USER_WXID}
 周次：{START_DATE} Sat — {END_DATE} Fri
 生成时间：{YYYY-MM-DD HH:mm}
-Skill 版本：v3.3.4
+Skill 版本：v3.3.5
 使用模型：{识别不到写 未识别}
 数据来源产品：{workbuddy / codebuddy / workbuddy + codebuddy / 无}
 数据来源：{sessions / memory-session-cwds / memory-expanded-siblings / conversation_search / history-search-user-provided / tier3 unavailable / tier3 all-failed 等实际组合}
@@ -422,6 +423,7 @@ mkdir -p ~/.codebuddy/skills/ai-usage-report && curl -sL "https://raw.githubuser
 
 ## Changelog
 
+- **v3.3.5** (2026-05-24)：补齐 `agent_created: true` frontmatter，便于 WorkBuddy skill 管理能力识别；压缩 INSTALL.md 历史版本段，减少安装文档噪音。
 - **v3.3.4** (2026-05-23)：加固 OTA 新版本提醒契约：检测到远端新版本时必须输出固定提醒块；人工模式停止并要求重新触发，automation 模式继续但在报告附注本次仍使用旧版 prompt。
 - **v3.3.3** (2026-05-23)：修正第三层历史搜索语义：`conversation_search`/`/search` 仅作为可选增强，必须先确认 agent 可读取搜索结果；未暴露时标记 `tier3 unavailable (history search not agent-callable)`。
 - **v3.3.2** (2026-05-23)：进一步聚焦 description 和主执行文档，统一强约束语气；新增样例隔离硬规则与任务格式自检 gate，明确 few-shot 绝不能计入实际任务。
@@ -436,6 +438,6 @@ mkdir -p ~/.codebuddy/skills/ai-usage-report && curl -sL "https://raw.githubuser
 - **v2.0** (2026-04-10)：建立 SQLite → memory → conversation_search 三层采集模式。
 - **v1.0** (2026-03-27)：初始版本。
 
-**当前版本**：v3.3.4
-**最后更新**：2026-05-23
+**当前版本**：v3.3.5
+**最后更新**：2026-05-24
 **维护人**：QC
