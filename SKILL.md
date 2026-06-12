@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 3.4.0
+version: 3.5.0
 agent_created: true
 description: "当用户要生成 AI 使用周报、统计本周 Agent 工作产出，或配置每周自动周报时使用。"
 ---
@@ -161,41 +161,79 @@ automation 模式禁止提问，直接降级。
 
 ### Step 2：采集数据
 
-#### 2.1 Session 索引（双源探测）
+#### 2.1 Session 索引（三源探测，中心库优先）
 
-> ⚠️ 自 WorkBuddy 近期升级（实测 v2.97.x 已切换，更早具体版本未确认）起，session 存储从 SQLite (`codebuddy-sessions.vscdb`) 切换为 JSON 心跳文件 (`~/.workbuddy/sessions/*.json`)，且新 JSON 只包含连接心跳信息（`pid` / `cwd` / `version` / `lastHeartbeat` / `startedAt` / `updatedAt`），**不再含 `conversationId` / `title` / `status`**。CodeBuddy CN 当前仍写旧 SQLite，但未来可能也切换。Skill 必须按产品分别探测两种格式，自动 fallback。
+> ⚠️ **存储格式演进（务必理解，否则必然漏报）**：WorkBuddy 当前版本已把会话与工作空间统一存入**中心库 `~/.workbuddy/workbuddy.db`**（SQLite），这是唯一权威、完整的数据源。早期版本曾用 `Application Support/{产品}/codebuddy-sessions.vscdb`，更早一版的过渡期还出现过 `~/.workbuddy/sessions/*.json` 进程心跳文件。三者的信息量天差地别：
+> - **中心库 `workbuddy.db`**：`sessions` 表含完整会话历史（id/cwd/title/model/status/created_at/updated_at），`workspaces` 表含全量工作空间清单。**第一优先源。**
+> - **旧 vscdb**：`ItemTable` 里有 conversationId/cwd/title，信息次之。
+> - **JSON 心跳**：只有 `pid/cwd/lastHeartbeat`，描述「**此刻还活着的进程**」而非「**本周开过的所有会话**」。它是**进程快照，不是会话历史**——只能作为 cwd 的补充，**绝不能当主源**。
+>
+> 历史教训（v3.4.0 漏报事故）：把心跳快照当成会话历史源，又用「vscdb 文件 mtime」做短路判断（文件 mtime ≠ 库内 updated_at），且完全没探测中心库，导致工作空间漏报率高达 ~77%。本版（v3.5.0）以中心库为第一可信源彻底修复。
 
 ##### 2.1.1 数据源探测矩阵
 
-按下表逐产品探测，**每个产品独立判断格式**，不得用一个产品的结果推断另一产品：
+按下表逐产品探测，**每个产品独立判断格式**，不得用一个产品的结果推断另一产品。探测顺序固定为 `central-db → legacy-vscdb → json-heartbeat`，**先命中先用，命中即停**：
 
-| 产品 | 旧 SQLite 路径 | 新 JSON 目录 |
-|------|----------------|--------------|
-| WorkBuddy | `~/Library/Application Support/WorkBuddy/codebuddy-sessions.vscdb` | `~/.workbuddy/sessions/` |
-| CodeBuddy CN | `~/Library/Application Support/CodeBuddy CN/codebuddy-sessions.vscdb` | `~/.codebuddy/sessions/` |
-| CodeBuddy 国际版 | `~/Library/Application Support/CodeBuddy/codebuddy-sessions.vscdb` | （路径未知，跳过新格式） |
+| 产品 | ① 中心库（最优先） | ② 旧 vscdb | ③ JSON 心跳目录（仅补充） |
+|------|---------------------|------------|---------------------------|
+| WorkBuddy | `~/.workbuddy/workbuddy.db` | `~/Library/Application Support/WorkBuddy/codebuddy-sessions.vscdb` | `~/.workbuddy/sessions/` |
+| CodeBuddy CN | `~/.codebuddy/codebuddy.db`、`~/Library/Application Support/CodeBuddy CN/codebuddy.db`（路径待产品确认，探测到即用） | `~/Library/Application Support/CodeBuddy CN/codebuddy-sessions.vscdb` | `~/.codebuddy/sessions/` |
+| CodeBuddy 国际版 | `~/.codebuddy/codebuddy.db`、`~/Library/Application Support/CodeBuddy/codebuddy.db`（待确认，探测到即用） | `~/Library/Application Support/CodeBuddy/codebuddy-sessions.vscdb` | （路径未知，跳过） |
 
-**探测口径**（按产品独立执行；规则按顺序短路求值，先命中先返回）：
+**探测口径**（按产品独立执行；按顺序短路求值，先命中先返回）：
 
-1. 旧 SQLite 文件存在 **且** mtime 在统计周期内（`>= START_DATE 00:00`）→ 该产品归类 `sqlite`，走 2.1.2 流程。**即使新 JSON 目录同时活跃，也优先 SQLite**——SQLite 含对话条目数据，信息更完整。
-2. 否则若新 JSON 目录存在且至少有一个 `*.json` 在统计周期内 → 该产品归类 `json-heartbeat`，走 2.1.3 流程
-3. 否则该产品归类 `unavailable`，跳过且不附注（用户没装就不算缺失）
+1. **中心库存在且可读** → 该产品归类 `central-db`，走 2.1.2 流程。这是最权威的源，命中后**直接停止该产品的后续探测**。
+2. 否则**旧 vscdb 文件存在**（**只判断文件存在/可读，不看 mtime**）→ 该产品归类 `legacy-vscdb`，走 2.1.3 流程。是否有本周数据由**库内时间字段**决定，不由文件 mtime 决定。
+3. 否则若 JSON 心跳目录存在且至少有一个 `*.json` 在统计周期内 → 该产品归类 `json-heartbeat`，走 2.1.4 流程（仅补充 cwd）。
+4. 否则该产品归类 `unavailable`，跳过且不附注（用户没装就不算缺失）。
 
-特殊情况：旧 SQLite 文件存在但 mtime 早于 START_DATE，且新 JSON 也存在 → 该产品归类 `json-heartbeat`，并在最终报告附注：
-> ℹ️ {产品} session 已切换为 JSON 心跳格式（旧 vscdb 最后写入 {旧 vscdb mtime YYYY-MM-DD}），本次未采集对话条目数；任务清单依赖 memory 层。
+> 🚫 **被废止的旧规则**：v3.4.0「旧 SQLite 文件 mtime 在统计周期内才走 SQLite 分支」的短路判断**已彻底删除**。文件 mtime 只用于「库文件是否存在/可读」，**绝不能用来判断库内是否有本周数据**——这是 v3.4.0 漏报的根因之一。
 
-##### 2.1.2 SQLite 分支（旧格式，可拿对话条目）
+##### 2.1.2 central-db 分支（中心库，第一可信源）
+
+**这是首选源，能一次性提供会话数 + 标题 + 工作空间 + 活跃天数 + 模型全部维度。**
+
+Schema（WorkBuddy `workbuddy.db`，实测）：
+- `sessions(id, cwd, user_id, title, custom_title, status, created_at, updated_at, deleted_at, model, last_activity_at, ...)`，时间字段为 **epoch 毫秒整数**。
+- `workspaces(path, last_opened_at)`，`last_opened_at` 为 **epoch 毫秒整数**。
+
+硬规则：
+- 必须用 Python（`sqlite3` 模块）查询。时间过滤**一律走库内字段**，禁止用文件 mtime。
+- **会话提取**（注意软删除过滤）：
+  ```sql
+  SELECT id, cwd, COALESCE(custom_title, title, '') AS title, updated_at, model
+  FROM sessions
+  WHERE updated_at >= {START_TS_MS} AND updated_at <= {END_TS_MS}
+    AND (deleted_at IS NULL OR deleted_at = 0)
+  ORDER BY updated_at DESC;
+  ```
+  - `START_TS_MS` = `START_DATE 00:00:00` 本地时区的 epoch 毫秒；`END_TS_MS` = `END_DATE 23:59:59` 本地时区的 epoch 毫秒。必须用 Python 由 `START_DATE`/`END_DATE` 计算，不得硬编码。
+  - 累加 `conversationId(=id) / cwd / title / model` 到 `CONVERSATIONS_BY_PRODUCT[product]`、`SESSION_CWDS`。
+  - 收集本周出现的 `model` 去重，供 frontmatter「使用模型」字段。
+- **工作空间双表并集**（关键，补全「打开过但无会话」的空间）：
+  ```sql
+  -- 表 2：本周打开过的工作空间
+  SELECT path FROM workspaces WHERE last_opened_at >= {START_TS_MS};
+  ```
+  - `WORKBUDDY_DB_WORKSPACES = {本周 sessions 的 cwd 去重} ∪ {workspaces.last_opened_at 落在周期内的 path}`，全部并入 `SESSION_CWDS`。
+- 该产品归入 `ACTIVE_PRODUCTS`。
+- 查询异常（库锁定 / 表不存在 / schema 不符）只跳过该产品的中心库源，**回退到 ② 旧 vscdb 继续探测**，并在报告附注 `ℹ️ {产品} 中心库读取失败（{原因}），已回退旧数据源`。
+
+##### 2.1.3 legacy-vscdb 分支（旧格式，可拿对话条目）
 
 Schema：`ItemTable.value` 是 JSON BLOB，含 `conversationId / cwd / userId / title / status / createdAt / updatedAt`。
 
 硬规则：
-- 必须用 Python 解析 JSON 与过滤时间；`sqlite3` CLI 只能读库，不能替代 Python
-- 时间过滤优先用 `updatedAt / lastUpdatedAt / updated_at`，全部缺失才回退 `createdAt`
-- 提取本周期内 conversation 列表：`conversationId / cwd / title / startedAt`
-- 累加到全局 `CONVERSATIONS_BY_PRODUCT[product]`、`SESSION_CWDS`
-- 该产品归入 `ACTIVE_PRODUCTS`
+- 必须用 Python 解析 JSON 与过滤时间；`sqlite3` CLI 只能读库，不能替代 Python。
+- **时间过滤一律走 BLOB 内的时间字段**（优先 `updatedAt / lastUpdatedAt / updated_at`，全部缺失才回退 `createdAt`），按 `>= START_TS_MS AND <= END_TS_MS` 过滤。**不得用文件 mtime 短路。**
+- 提取本周期内 conversation 列表：`conversationId / cwd / title / startedAt`。
+- 累加到全局 `CONVERSATIONS_BY_PRODUCT[product]`、`SESSION_CWDS`。
+- 该产品归入 `ACTIVE_PRODUCTS`。
+- 若库内本周无任何会话，仍归 `legacy-vscdb`（库可读但本周空），对话数计 0，不附注缺失。
 
-##### 2.1.3 JSON 心跳分支（新格式，仅能拿 cwd）
+##### 2.1.4 json-heartbeat 分支（进程心跳，仅补充 cwd）
+
+> 语义警告：心跳文件描述「此刻活着的进程」，不是「本周会话历史」。仅在中心库和旧 vscdb 都不可用时才走此分支，且**只用于补漏当前活跃进程的 cwd**。
 
 Schema：每个 `*.json` 形如：
 ```json
@@ -204,29 +242,41 @@ Schema：每个 `*.json` 形如：
 ```
 
 硬规则：
-- 必须用 Python 读取目录顶层 `*.json`（不递归子目录），按 `updatedAt` (回退 `lastHeartbeat`) 过滤统计周期内文件
-- 仅提取 `cwd` 去重，累加到 `SESSION_CWDS`
-- **不得伪造 conversation 数**：`CONVERSATIONS_BY_PRODUCT[product]` 必须置 `None`，不得用 session 文件数充数
-- 该产品归入 `ACTIVE_PRODUCTS`，并在最终报告附注。附注模板二选一（**不得同时输出两条**）：
-  - 旧 vscdb 文件存在 → 用 2.1.1 特殊情况模板（含旧 vscdb 最后写入日期）
-  - 旧 vscdb 文件不存在 → 用默认模板「{产品} session 为 JSON 心跳格式，未采集对话条目数」
+- 必须用 Python 读取目录顶层 `*.json`（不递归子目录），按 `updatedAt`（回退 `lastHeartbeat`）过滤统计周期内文件。
+- 仅提取 `cwd` 去重，累加到 `SESSION_CWDS`。
+- **不得伪造 conversation 数**：`CONVERSATIONS_BY_PRODUCT[product]` 必须置 `None`，不得用 session 文件数充数。
+- 该产品归入 `ACTIVE_PRODUCTS`，并在最终报告附注：
+  > ℹ️ {产品} 未探测到中心库与可读 vscdb，本次仅用 session 心跳目录补充当前活跃进程的工作空间；完整会话与工作空间清单可能不全，任务清单依赖 memory 层。
 
-##### 2.1.4 多源合并
+##### 2.1.5 多源合并
 
-- `SESSION_CWDS = ∪ all products`（按绝对路径去重）
-- `ACTIVE_PRODUCTS = {归类为 sqlite 或 json-heartbeat 的产品}`
-- 对话数仅累加 `sqlite` 分支的产品；JSON 心跳产品不参与对话数统计
-- 任一产品采集失败只跳过该产品；全部失败则继续 memory 层，并在报告附注 `⚠️ session 索引层未采集成功，本次任务清单完全依赖 memory 层`
+- `SESSION_CWDS = ∪ all products`（按绝对路径去重）。
+- `ACTIVE_PRODUCTS = {归类为 central-db / legacy-vscdb / json-heartbeat 的产品}`。
+- 对话数仅累加 `central-db` 与 `legacy-vscdb` 分支的产品；JSON 心跳产品不参与对话数统计。
+- 任一产品采集失败只跳过该产品；全部失败则继续 memory 层，并在报告附注 `⚠️ session 索引层未采集成功，本次任务清单完全依赖 memory 层`。
 
-##### 2.1.5 数据来源标签合成
+##### 2.1.6 数据来源标签合成
 
-报告 frontmatter 的"数据来源"字段中 session 部分按以下规则填：
-- 仅 SQLite 分支产品 → `sessions-sqlite`
+报告 frontmatter 的"数据来源"字段中 session 部分按以下规则填（取所有 `ACTIVE_PRODUCTS` 的分支集合）：
+- 仅 central-db 分支产品 → `sessions-central-db`
+- 仅 legacy-vscdb 分支产品 → `sessions-legacy-vscdb`
 - 仅 JSON 心跳分支产品 → `sessions-json-heartbeat`
-- 同时存在两种分支产品 → `sessions-mixed`
+- 存在 ≥2 种不同分支 → `sessions-mixed`
 - 所有产品都不可用 → `sessions-unavailable`
 
 后续的 memory / 历史搜索来源标签（`memory-session-cwds` / `memory-expanded-siblings` / `conversation_search` 等）按既有逻辑追加，多个标签用逗号连接。
+
+##### 2.1.7 低数量自检告警（防未来再漏报）
+
+合并完成后，若最终识别出的**活跃工作空间数 ≤ 3** 或 **对话数 ≤ 2**（且数据源不是 `sessions-unavailable`），必须在周报正文最顶部加一条告警块，让用户第一时间发现可能漏报，而不是默默接受错误结果：
+
+```text
+⚠️ 本次仅识别到 {N} 个工作空间 / {M} 条会话，可能存在数据源探测不全。
+已尝试的源：{命中分支列表，如 central-db / legacy-vscdb / json-heartbeat}。
+如与实际不符，请检查中心库 ~/.workbuddy/workbuddy.db 是否可读。
+```
+
+若数据源本就是 `sessions-unavailable`（用户确实没装/无数据），不触发此告警。
 
 #### 2.2 memory 日志
 
@@ -280,7 +330,7 @@ limit = 10
 
 #### 2.4 合并口径
 
-- Session 索引提供时间线、workspace 列表，**仅 SQLite 分支**还能提供对话标题与产品对话数；JSON 心跳分支只贡献 cwd
+- Session 索引提供时间线、workspace 列表，**central-db 与 legacy-vscdb 分支**还能提供对话标题、模型与产品对话数；JSON 心跳分支只贡献 cwd
 - memory 是任务事实的主来源
 - 历史对话搜索只补充上下文，不得覆盖 memory 中的明确事实
 - 最终按"可交付产出"聚合，进入 Step 3
@@ -306,10 +356,10 @@ limit = 10
 企业微信 ID：{USER_WXID}
 周次：{START_DATE} Sat — {END_DATE} Fri
 生成时间：{YYYY-MM-DD HH:mm}
-Skill 版本：v3.4.0
+Skill 版本：v3.5.0
 使用模型：{识别不到写 未识别}
 数据来源产品：{workbuddy / codebuddy / workbuddy + codebuddy / 无}
-数据来源：{sessions-sqlite / sessions-json-heartbeat / sessions-mixed / memory-session-cwds / memory-expanded-siblings / conversation_search / history-search-user-provided / tier3 unavailable / tier3 all-failed 等实际组合}
+数据来源：{sessions-central-db / sessions-legacy-vscdb / sessions-json-heartbeat / sessions-mixed / memory-session-cwds / memory-expanded-siblings / conversation_search / history-search-user-provided / tier3 unavailable / tier3 all-failed 等实际组合}
 
 【本周完成的任务】
 {真实任务清单；无事实则写“未检测到本周任务记录”}
@@ -318,15 +368,15 @@ Skill 版本：v3.4.0
 {写代码 · 写文档 · 搜索资料 · 数据处理 · PPT/PDF · 浏览器自动化 · 定时任务 · 图片生成 · 知识库管理 · 代码审查 · 其他}
 
 【本周对话统计】
-- 总对话数：{合并 SQLite 分支产品的对话数；多产品时附拆分；JSON 心跳产品写明"未采集"。若所有产品都只有 JSON 心跳格式，写 `未采集（session 已切换为心跳格式）`}
+- 总对话数：{合并 central-db 与 legacy-vscdb 分支产品的对话数；多产品时附拆分；JSON 心跳产品写明"未采集"。若所有产品都只有 JSON 心跳格式，写 `未采集（session 仅心跳格式可用，未探测到中心库）`}
 - 活跃工作空间：{去重列表；无则写 无}
 - 活跃天数：{去重天数}
 
 混合模式（sessions-mixed）总对话数推荐写法：
 ```text
-- 总对话数：未采集（WorkBuddy session 已切换为心跳格式；CodeBuddy CN 走 SQLite 共 {N} 条）
-  - WorkBuddy: 未采集（心跳格式）
-  - CodeBuddy CN: {N} 条
+- 总对话数：{合并可采集产品的对话数；不可采集的产品逐项说明}
+  - WorkBuddy: {N} 条（中心库）
+  - CodeBuddy CN: {M} 条（旧 vscdb）
 ```
 
 【未完成 / 中途放弃的任务】
@@ -479,6 +529,7 @@ mkdir -p ~/.codebuddy/skills/ai-usage-report && curl -sL "https://raw.githubuser
 
 ## Changelog
 
+- **v3.5.0** (2026-06-13)：修复 v3.4.0 工作空间漏报 P1 事故（漏报率曾达 ~77%）。Step 2.1 改为「中心库优先」三源探测：① `~/.workbuddy/workbuddy.db` 中心库（`sessions` + `workspaces` 双表，含会话数/标题/模型/工作空间全字段，第一可信源）→ ② 旧 vscdb（按库内时间字段过滤）→ ③ JSON 心跳（降级为仅补充 cwd 的补充源）。彻底删除「vscdb 文件 mtime 短路判断」（文件 mtime ≠ 库内 updated_at 是漏报根因）。工作空间采集改为 `sessions.cwd ∪ workspaces.path` 双表并集，补全「打开过但无会话」的空间。新增数据来源标签 `sessions-central-db` / `sessions-legacy-vscdb`；新增低数量自检告警（工作空间 ≤3 或会话 ≤2 时报警）。CodeBuddy CN/国际版预留中心库探测条目（路径待产品确认），探测到即用，否则回退旧 vscdb（当前 CodeBuddy CN 仍写 vscdb，无此问题）。
 - **v3.4.0** (2026-05-30)：适配 WorkBuddy v2.97 起 session 存储从 SQLite 切换为 `~/.workbuddy/sessions/*.json` 心跳文件。Step 2.1 重写为「按产品独立探测」的双源采集：旧 SQLite 在则用 SQLite（拿全字段）、否则 fallback 到新 JSON 心跳（仅拿 cwd）。新增数据来源标签 `sessions-sqlite` / `sessions-json-heartbeat` / `sessions-mixed`；JSON 心跳分支不再伪造对话条目数。CodeBuddy CN 当前仍写旧 SQLite，自动按存在性走对应分支，未来 CodeBuddy CN 也切换时无需改 Skill。
 - **v3.3.5** (2026-05-24)：补齐 `agent_created: true` frontmatter，便于 WorkBuddy skill 管理能力识别；压缩 INSTALL.md 历史版本段，减少安装文档噪音。
 - **v3.3.4** (2026-05-23)：加固 OTA 新版本提醒契约：检测到远端新版本时必须输出固定提醒块；人工模式停止并要求重新触发，automation 模式继续但在报告附注本次仍使用旧版 prompt。
@@ -495,6 +546,6 @@ mkdir -p ~/.codebuddy/skills/ai-usage-report && curl -sL "https://raw.githubuser
 - **v2.0** (2026-04-10)：建立 SQLite → memory → conversation_search 三层采集模式。
 - **v1.0** (2026-03-27)：初始版本。
 
-**当前版本**：v3.4.0
-**最后更新**：2026-05-30
+**当前版本**：v3.5.0
+**最后更新**：2026-06-13
 **维护人**：QC
