@@ -1,7 +1,7 @@
 ---
 name: ai-usage-report
 slug: ai-usage-report
-version: 3.5.0
+version: 3.5.1
 agent_created: true
 description: "当用户要生成 AI 使用周报、统计本周 Agent 工作产出，或配置每周自动周报时使用。"
 ---
@@ -59,21 +59,53 @@ fi
 date "+%Y-%m-%d %A %H:%M"
 ```
 
-统计周期固定为：上周六 00:00 — 本周五 23:59。变量格式：
+统计周期固定为：**上周六 00:00 — 本周五 23:59**。必须用以下确定性算法计算，禁止人工推算或硬编码星期缩写：
 
-```text
-START_DATE=YYYY-MM-DD
-END_DATE=YYYY-MM-DD
-TODAY=YYYY-MM-DD
+```bash
+TODAY=$(date "+%Y-%m-%d")
+DOW=$(date "+%u")  # 1=Mon ... 7=Sun
+# 上周六偏移量：Mon→-2, Tue→-3, ..., Sat→-7（跑上一周）, Sun→-1（昨天）
+if [ "$DOW" = "7" ]; then
+  SAT_OFFSET=1
+else
+  SAT_OFFSET=$((DOW + 1))
+fi
+START_DATE=$(date -j -v-${SAT_OFFSET}d "+%Y-%m-%d")
+# 本周五 = START_DATE + 6 天
+END_DATE=$(date -j -v+6d -f "%Y-%m-%d" "$START_DATE" "+%Y-%m-%d")
+# 实际星期（用于模板输出，禁止硬编码 Sat/Fri）
+START_WEEKDAY=$(date -j -f "%Y-%m-%d" "$START_DATE" "+%a")
+END_WEEKDAY=$(date -j -f "%Y-%m-%d" "$END_DATE" "+%a")
+```
+
+验证规则（fail-loud，不通过则停止生成并报错）：
+
+```bash
+START_DOW=$(date -j -f "%Y-%m-%d" "$START_DATE" "+%u")
+END_DOW=$(date -j -f "%Y-%m-%d" "$END_DATE" "+%u")
+if [ "$START_DOW" != "6" ] || [ "$END_DOW" != "5" ]; then
+  echo "❌ FATAL: date self-check failed — START_DATE=$START_DATE (expected Sat, got dow=$START_DOW), END_DATE=$END_DATE (expected Fri, got dow=$END_DOW)"
+  # 停止生成，不得继续
+fi
 ```
 
 `END_DATE` 必须 clamp 到不晚于今天：
 
 ```bash
-TODAY=$(date "+%Y-%m-%d")
 if [[ "$END_DATE" > "$TODAY" ]]; then
   END_DATE="$TODAY"
+  END_WEEKDAY=$(date -j -f "%Y-%m-%d" "$END_DATE" "+%a")
 fi
+```
+
+变量清单（后续步骤全部引用这些变量）：
+
+```text
+TODAY=YYYY-MM-DD
+START_DATE=YYYY-MM-DD
+END_DATE=YYYY-MM-DD
+START_WEEKDAY=三个字母星期缩写（如 Sat）
+END_WEEKDAY=三个字母星期缩写（如 Fri）
 ```
 
 #### 0.3 OTA 版本检查
@@ -354,9 +386,9 @@ limit = 10
 ---
 姓名：{USER_NAME 或 未识别}
 企业微信 ID：{USER_WXID}
-周次：{START_DATE} Sat — {END_DATE} Fri
+周次：{START_DATE} {START_WEEKDAY} — {END_DATE} {END_WEEKDAY}
 生成时间：{YYYY-MM-DD HH:mm}
-Skill 版本：v3.5.0
+Skill 版本：v3.5.1
 使用模型：{识别不到写 未识别}
 数据来源产品：{workbuddy / codebuddy / workbuddy + codebuddy / 无}
 数据来源：{sessions-central-db / sessions-legacy-vscdb / sessions-json-heartbeat / sessions-mixed / memory-session-cwds / memory-expanded-siblings / conversation_search / history-search-user-provided / tier3 unavailable / tier3 all-failed 等实际组合}
@@ -529,6 +561,7 @@ mkdir -p ~/.codebuddy/skills/ai-usage-report && curl -sL "https://raw.githubuser
 
 ## Changelog
 
+- **v3.5.1** (2026-06-22)：修复 Step 0.2 日期/星期计算 bug。加入确定性日期算法（`date -v` 从 TODAY 推算上周六/本周五），消除硬编码 Sat/Fri 模板字面量；新增星期自检 fail-loud（START_DATE 必须为周六、END_DATE 必须为周五，否则停止生成）；END_DATE clamp 后同步更新 END_WEEKDAY；frontmatter 周次行改用 `{START_WEEKDAY}`/`{END_WEEKDAY}` 变量。根因：v3.5.0 Step 0.2 只写"上周六—本周五"但无算法，Agent 在边界日运行时会生成错误星期标注（如 kasonkang 报告出现 `2026-06-22 Fri`，实际 06-22 是周一）。
 - **v3.5.0** (2026-06-13)：修复 v3.4.0 工作空间漏报 P1 事故（漏报率曾达 ~77%）。Step 2.1 改为「中心库优先」三源探测：① `~/.workbuddy/workbuddy.db` 中心库（`sessions` + `workspaces` 双表，含会话数/标题/模型/工作空间全字段，第一可信源）→ ② 旧 vscdb（按库内时间字段过滤）→ ③ JSON 心跳（降级为仅补充 cwd 的补充源）。彻底删除「vscdb 文件 mtime 短路判断」（文件 mtime ≠ 库内 updated_at 是漏报根因）。工作空间采集改为 `sessions.cwd ∪ workspaces.path` 双表并集，补全「打开过但无会话」的空间。新增数据来源标签 `sessions-central-db` / `sessions-legacy-vscdb`；新增低数量自检告警（工作空间 ≤3 或会话 ≤2 时报警）。CodeBuddy CN/国际版预留中心库探测条目（路径待产品确认），探测到即用，否则回退旧 vscdb（当前 CodeBuddy CN 仍写 vscdb，无此问题）。
 - **v3.4.0** (2026-05-30)：适配 WorkBuddy v2.97 起 session 存储从 SQLite 切换为 `~/.workbuddy/sessions/*.json` 心跳文件。Step 2.1 重写为「按产品独立探测」的双源采集：旧 SQLite 在则用 SQLite（拿全字段）、否则 fallback 到新 JSON 心跳（仅拿 cwd）。新增数据来源标签 `sessions-sqlite` / `sessions-json-heartbeat` / `sessions-mixed`；JSON 心跳分支不再伪造对话条目数。CodeBuddy CN 当前仍写旧 SQLite，自动按存在性走对应分支，未来 CodeBuddy CN 也切换时无需改 Skill。
 - **v3.3.5** (2026-05-24)：补齐 `agent_created: true` frontmatter，便于 WorkBuddy skill 管理能力识别；压缩 INSTALL.md 历史版本段，减少安装文档噪音。
@@ -546,6 +579,6 @@ mkdir -p ~/.codebuddy/skills/ai-usage-report && curl -sL "https://raw.githubuser
 - **v2.0** (2026-04-10)：建立 SQLite → memory → conversation_search 三层采集模式。
 - **v1.0** (2026-03-27)：初始版本。
 
-**当前版本**：v3.5.0
-**最后更新**：2026-06-13
+**当前版本**：v3.5.1
+**最后更新**：2026-06-22
 **维护人**：QC
